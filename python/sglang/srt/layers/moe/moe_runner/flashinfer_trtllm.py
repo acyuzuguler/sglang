@@ -89,6 +89,7 @@ def finalize_flashinfer_trtllm_deferred_output(
         shared_output,
         deferred_output.top_k,
         enable_pdl=is_arch_support_pdl(),
+        out=shared_output,
     )
 
 
