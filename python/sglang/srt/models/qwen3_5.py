@@ -1436,6 +1436,9 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
 
         return loaded_params
 
+    def flush_cache(self, rid):
+        for layer in self.layers:
+            layer.mlp.flush_cache(rid)
 
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
@@ -1588,7 +1591,6 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     weight_loader(param_lm_head, loaded_weight)
             loaded_params.add(name)
         return loaded_params
-
 
 class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
     """Qwen3.5 MoE Vision-Language Model."""
@@ -1975,5 +1977,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             num_groups=None,
         )
 
+    def flush_cache(self, rid):
+        self.model.flush_cache(rid)
 
 EntryClass = [Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]

@@ -204,6 +204,11 @@ class Qwen2MoeMLP(nn.Module):
 
 from collections import OrderedDict
 import json 
+import os 
+
+EXP_DIR = os.getenv("EXP_DIR", "/home/ayuzuguler/cache-aware-moe/eval/experiments/tmp")
+with open(os.path.join(EXP_DIR, "exp_args.json"), "r") as f:
+    exp_args = json.load(f)
 
 class Cache:
     def __init__(self, layer_id, rid, capacity) -> None:
@@ -214,6 +219,9 @@ class Cache:
         self.n_miss = 0
         self.layer_id = layer_id
         self.rid = rid
+
+    def __exit__(self, exc_type, exc, tb):
+        print(f"Cache {self.layer_id} for {self.rid} exited")
 
     def init_random(self):
         for e in range(self.capacity):
@@ -243,8 +251,8 @@ class Cache:
     def get_experts_in_cache(self):
         return list(self._dat.keys())
     
-    def dump(self):
-        with open("eval/cache_stats.jsonl", "a") as f:
+    def flush(self):
+        with open(os.path.join(EXP_DIR, "cache_stats.jsonl"), "a") as f:
             total = self.n_hits + self.n_miss
             hit_ratio = self.n_hits / total if total > 0 else 0
             f.write(json.dumps(
@@ -266,6 +274,7 @@ class CacheAwareTopk(torch.nn.Module):
         self.topk = top_k
         self.renormalize = renormalize
         self.layer_id = layer_id
+        self.fixed_num_experts = exp_args["fixed_num_experts"]
 
     def forward(self, hidden_states, router_logits, cached_experts=None):
         if cached_experts is None:
@@ -279,7 +288,6 @@ class CacheAwareTopk(torch.nn.Module):
                 router_logits=router_logits,
             )
         else:
-            FIXED_EXPERTS = 3
             n_tokens, num_experts = router_logits.shape
 
             topks = torch.argsort(router_logits.float(), descending=True, dim=-1).to(torch.int32)
@@ -292,7 +300,7 @@ class CacheAwareTopk(torch.nn.Module):
             cached_at_pos = torch.gather(cache_mask, 1, topks)              # [n_tokens, K] bool
 
             # keep: first FIXED_EXPERTS always, plus cached ones among the rest
-            keep = (ar < FIXED_EXPERTS) | cached_at_pos                    # [n_tokens, K]
+            keep = (ar < self.fixed_num_experts) | cached_at_pos                    # [n_tokens, K]
 
             # stable partition: kept positions keep their order up front, rest pushed back
             sort_key = torch.where(keep, ar, ar + num_experts)
@@ -366,7 +374,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             layer_id=layer_id,            
         )
 
-        self.cache_cap = 32
+        self.cache_cap = exp_args["cache_capacity"]
         self.cache = {}
 
         self.experts = get_moe_impl_class(quant_config)(
@@ -439,6 +447,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
             self.top_k = config.num_experts_per_tok
         self.is_nextn = is_nextn
+
+    def flush_cache(self, rid):
+        if rid in self.cache:
+            self.cache[rid].flush()
 
     def get_moe_weights(self):
         return [
@@ -556,22 +568,17 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         num_tokens, n_experts = router_logits.shape 
         is_decode = forward_batch.batch_size == num_tokens
         
-        # cached_experts = [[i for i in range(n_experts)] for j in range(num_tokens)]
         if is_decode:
             cached_experts = [self.cache[rid].get_experts_in_cache() for rid in forward_batch.rids]
+            # cached_experts = [[i for i in range(8)] for j in range(num_tokens)]
         else:
             cached_experts = None
         topk_output = self.topk(hidden_states, router_logits, cached_experts)
         selected = topk_output.topk_ids
+
         n_tokens = selected.shape[0]
 
         if is_decode: assert n_tokens == len(forward_batch.rids)
-        if is_decode:
-            finished = [rid for rid in self.cache.keys() if rid not in forward_batch.rids]
-            for rid in finished:
-                # this indicates that the rid is completed.
-                self.cache[rid].dump()
-                del self.cache[rid]
 
         for i, rid in enumerate(forward_batch.rids):
             if rid not in self.cache:
