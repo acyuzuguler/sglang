@@ -202,6 +202,115 @@ class Qwen2MoeMLP(nn.Module):
         )
         return x
 
+from collections import OrderedDict
+import json 
+
+class Cache:
+    def __init__(self, layer_id, rid, capacity) -> None:
+        self.capacity = capacity
+        self._dat = OrderedDict()
+        self.init_random()
+        self.n_hits = 0
+        self.n_miss = 0
+        self.layer_id = layer_id
+        self.rid = rid
+
+    def init_random(self):
+        for e in range(self.capacity):
+            self._dat[e] = 0
+
+    def evict(self):
+        if len(self._dat) == self.capacity:
+            self._dat.popitem(last=False)
+
+    def read(self, experts, is_decode):
+        hits = [e for e in experts if e in self._dat]
+        misses = [e for e in experts if e not in hits]
+
+        if is_decode:
+            self.n_hits += len(hits)
+            self.n_miss += len(misses)
+
+        for e in experts:
+            if e in self._dat:
+                self._dat.move_to_end(e)
+            else:
+                self.evict()
+                self._dat[e] = 0
+        
+        return hits
+    
+    def get_experts_in_cache(self):
+        return list(self._dat.keys())
+    
+    def dump(self):
+        with open("eval/cache_stats.jsonl", "a") as f:
+            total = self.n_hits + self.n_miss
+            hit_ratio = self.n_hits / total if total > 0 else 0
+            f.write(json.dumps(
+                {
+                    "layer_id": self.layer_id,
+                    "rid": self.rid,
+                    "n_hits": self.n_hits,
+                    "n_miss": self.n_miss,
+                    "hit_ratio": hit_ratio
+                }
+            ))
+            f.write("\n")
+
+
+class CacheAwareTopk(torch.nn.Module):
+    def __init__(self, top_k, renormalize, layer_id) -> None:
+        super().__init__()
+        assert renormalize == True, "renormalize == False is not yet supported" 
+        self.topk = top_k
+        self.renormalize = renormalize
+        self.layer_id = layer_id
+
+    def forward(self, hidden_states, router_logits, cached_experts=None):
+        if cached_experts is None:
+            topk_ids = torch.topk(router_logits.float(), self.topk, dim=-1).indices.to(torch.int32)
+            # topk_ids = torch.argsort(router_logits.float(), descending=True, dim=-1).to(torch.int32)[:, :8].contiguous()
+
+            topk_weights = torch.gather(router_logits.float(), 1, topk_ids).softmax(dim=-1)
+            out = StandardTopKOutput(
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                router_logits=router_logits,
+            )
+        else:
+            FIXED_EXPERTS = 3
+            n_tokens, num_experts = router_logits.shape
+
+            topks = torch.argsort(router_logits.float(), descending=True, dim=-1).to(torch.int32)
+            
+            ar = torch.arange(num_experts, device=topks.device).unsqueeze(0)
+
+            cache_mask = torch.nn.functional.one_hot(torch.tensor(cached_experts, device=topks.device), num_classes=num_experts).sum(dim=1).bool()
+
+            # is the expert at sorted-position j cached for this token?
+            cached_at_pos = torch.gather(cache_mask, 1, topks)              # [n_tokens, K] bool
+
+            # keep: first FIXED_EXPERTS always, plus cached ones among the rest
+            keep = (ar < FIXED_EXPERTS) | cached_at_pos                    # [n_tokens, K]
+
+            # stable partition: kept positions keep their order up front, rest pushed back
+            sort_key = torch.where(keep, ar, ar + num_experts)
+            order = torch.argsort(sort_key, dim=1, stable=True)            # [n_tokens, K]
+
+            selected = torch.gather(topks, 1, order)[:, :self.topk].contiguous()        # [n_tokens, topk]
+
+            topkw = torch.gather(router_logits.float(), dim=1, index=selected).softmax(dim=-1)
+            out = StandardTopKOutput(
+                topk_weights=topkw,
+                topk_ids=selected,
+                router_logits=router_logits,
+            )
+
+            # assert torch.allclose(topk_ids, selected), f"mismatch: {topk_ids} vs {selected}"
+            # assert torch.allclose(topk_weights, topkw), f"mismatch: {topk_weights} vs {topkw}"
+
+        return out
 
 class Qwen2MoeSparseMoeBlock(nn.Module):
     def __init__(
@@ -246,11 +355,19 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if self.enable_shared_expert_fusion:
             self.num_fused_shared_experts = self.num_shared_experts
 
-        self.topk = TopK(
+        # self.topk = TopK(
+        #     top_k=config.num_experts_per_tok,
+        #     renormalize=config.norm_topk_prob,
+        #     layer_id=layer_id,
+        # )
+        self.topk = CacheAwareTopk(
             top_k=config.num_experts_per_tok,
             renormalize=config.norm_topk_prob,
-            layer_id=layer_id,
+            layer_id=layer_id,            
         )
+
+        self.cache_cap = 32
+        self.cache = {}
 
         self.experts = get_moe_impl_class(quant_config)(
             layer_id=self.layer_id,
@@ -433,10 +550,34 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         return final_hidden_states
 
-    def _forward_router_experts(self, hidden_states: torch.Tensor):
+    def _forward_router_experts(self, hidden_states: torch.Tensor, forward_batch: Optional[ForwardBatch] = None,):
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
+        num_tokens, n_experts = router_logits.shape 
+        is_decode = forward_batch.batch_size == num_tokens
+        
+        # cached_experts = [[i for i in range(n_experts)] for j in range(num_tokens)]
+        if is_decode:
+            cached_experts = [self.cache[rid].get_experts_in_cache() for rid in forward_batch.rids]
+        else:
+            cached_experts = None
+        topk_output = self.topk(hidden_states, router_logits, cached_experts)
+        selected = topk_output.topk_ids
+        n_tokens = selected.shape[0]
+
+        if is_decode: assert n_tokens == len(forward_batch.rids)
+        if is_decode:
+            finished = [rid for rid in self.cache.keys() if rid not in forward_batch.rids]
+            for rid in finished:
+                # this indicates that the rid is completed.
+                self.cache[rid].dump()
+                del self.cache[rid]
+
+        for i, rid in enumerate(forward_batch.rids):
+            if rid not in self.cache:
+                self.cache[rid] = Cache(self.layer_id, rid, self.cache_cap)
+            self.cache[rid].read(selected[i].tolist(), is_decode)
+
         if self.enable_shared_expert_fusion and TopKOutputChecker.format_is_standard(
             topk_output
         ):
@@ -481,7 +622,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
         else:
             shared_output = self._forward_shared_experts(hidden_states)
-            final_hidden_states = self._forward_router_experts(hidden_states)
+            final_hidden_states = self._forward_router_experts(hidden_states, forward_batch)
 
         if shared_output is not None:
             # In-place add is required to keep final_hidden_states in the
