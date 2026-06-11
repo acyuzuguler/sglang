@@ -363,16 +363,20 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if self.enable_shared_expert_fusion:
             self.num_fused_shared_experts = self.num_shared_experts
 
-        # self.topk = TopK(
-        #     top_k=config.num_experts_per_tok,
-        #     renormalize=config.norm_topk_prob,
-        #     layer_id=layer_id,
-        # )
-        self.topk = CacheAwareTopk(
-            top_k=config.num_experts_per_tok,
-            renormalize=config.norm_topk_prob,
-            layer_id=layer_id,            
-        )
+        if exp_args["topk_method"] == "vanilla":
+            self.topk = TopK(
+                top_k=config.num_experts_per_tok,
+                renormalize=config.norm_topk_prob,
+                layer_id=layer_id,
+            )
+        elif exp_args["topk_method"] == "cache_aware":
+            self.topk = CacheAwareTopk(
+                top_k=config.num_experts_per_tok,
+                renormalize=config.norm_topk_prob,
+                layer_id=layer_id,            
+            )
+        else:
+            raise NotImplementedError
 
         self.cache_cap = exp_args["cache_capacity"]
         self.cache = {}
@@ -570,10 +574,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         
         if is_decode:
             cached_experts = [self.cache[rid].get_experts_in_cache() for rid in forward_batch.rids]
-            # cached_experts = [[i for i in range(8)] for j in range(num_tokens)]
         else:
             cached_experts = None
-        topk_output = self.topk(hidden_states, router_logits, cached_experts)
+
+        if isinstance(self.topk, TopK):
+            topk_output = self.topk(hidden_states, router_logits)
+        else:
+            topk_output = self.topk(hidden_states, router_logits, cached_experts)
         selected = topk_output.topk_ids
 
         n_tokens = selected.shape[0]
