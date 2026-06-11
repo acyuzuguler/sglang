@@ -206,7 +206,7 @@ from collections import OrderedDict
 import json 
 import os 
 
-EXP_DIR = os.getenv("EXP_DIR", "/home/ayuzuguler/cache-aware-moe/eval/experiments/tmp")
+EXP_DIR = os.getenv("EXP_DIR", os.path.join(os.path.abspath(os.path.curdir), "eval/experiments/tmp"))
 with open(os.path.join(EXP_DIR, "exp_args.json"), "r") as f:
     exp_args = json.load(f)
 
