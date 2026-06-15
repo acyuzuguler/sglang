@@ -278,29 +278,45 @@ class CacheAwareTopk(torch.nn.Module):
 
     def forward(self, hidden_states, router_logits, cached_experts=None):
         if cached_experts is None:
-            topk_ids = torch.topk(router_logits.float(), self.topk, dim=-1).indices.to(torch.int32)
-            # topk_ids = torch.argsort(router_logits.float(), descending=True, dim=-1).to(torch.int32)[:, :8].contiguous()
+            # topk_ids = torch.topk(router_logits.float(), self.topk, dim=-1).indices.contiguous()
 
-            topk_weights = torch.gather(router_logits.float(), 1, topk_ids).softmax(dim=-1)
+            # topk_weights = torch.gather(router_logits.float(), 1, topk_ids).softmax(dim=-1).contiguous()
+            # assert topk_weights.is_contiguous()
+
+            logits = router_logits.float()                          # upcast bf16/fp16 -> fp32, as the kernel does
+            probs = torch.softmax(logits, dim=-1)                   # softmax over ALL experts, fp32
+
+            order = torch.argsort(probs, dim=-1, descending=True, stable=True)
+            topk_ids = order[:, :self.topk].to(torch.int32).contiguous()
+
+            topk_weights = torch.gather(probs, 1, topk_ids.long())
+
+            if self.renormalize:
+                topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+
             out = StandardTopKOutput(
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
                 router_logits=router_logits,
             )
         else:
-            n_tokens, num_experts = router_logits.shape
+            logits = router_logits.float()
+            n_tokens, num_experts = logits.shape
 
-            topks = torch.argsort(router_logits.float(), descending=True, dim=-1).to(torch.int32)
+            probs = torch.softmax(logits, dim=-1)    
+
+            topks = torch.argsort(probs, descending=True, dim=-1).to(torch.int32).contiguous()
             
             ar = torch.arange(num_experts, device=topks.device).unsqueeze(0)
 
-            cache_mask = torch.nn.functional.one_hot(torch.tensor(cached_experts, device=topks.device), num_classes=num_experts).sum(dim=1).bool()
+            cache_mask = torch.nn.functional.one_hot(torch.tensor(cached_experts, device=topks.device) , num_classes=num_experts).sum(dim=1).bool()
 
             # is the expert at sorted-position j cached for this token?
-            cached_at_pos = torch.gather(cache_mask, 1, topks)              # [n_tokens, K] bool
+            cached_at_pos = torch.gather(cache_mask, 1, topks).contiguous()              # [n_tokens, K] bool
 
             # keep: first FIXED_EXPERTS always, plus cached ones among the rest
-            keep = (ar < self.fixed_num_experts) | cached_at_pos                    # [n_tokens, K]
+            fixed_num_experts = 2
+            keep = (ar < fixed_num_experts) | cached_at_pos                    # [n_tokens, K]
 
             # stable partition: kept positions keep their order up front, rest pushed back
             sort_key = torch.where(keep, ar, ar + num_experts)
@@ -308,15 +324,16 @@ class CacheAwareTopk(torch.nn.Module):
 
             selected = torch.gather(topks, 1, order)[:, :self.topk].contiguous()        # [n_tokens, topk]
 
-            topkw = torch.gather(router_logits.float(), dim=1, index=selected).softmax(dim=-1)
+            topk_weights = torch.gather(probs, dim=1, index=selected).contiguous()
+
+            if self.renormalize:
+                topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+
             out = StandardTopKOutput(
-                topk_weights=topkw,
+                topk_weights=topk_weights,
                 topk_ids=selected,
                 router_logits=router_logits,
             )
-
-            # assert torch.allclose(topk_ids, selected), f"mismatch: {topk_ids} vs {selected}"
-            # assert torch.allclose(topk_weights, topkw), f"mismatch: {topk_weights} vs {topkw}"
 
         return out
 
@@ -580,6 +597,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if isinstance(self.topk, TopK):
             topk_output = self.topk(hidden_states, router_logits)
         else:
+            # cached_experts = [[e for e in range(256)] for _ in range(num_tokens)]
+            # cached_experts = None
             topk_output = self.topk(hidden_states, router_logits, cached_experts)
         selected = topk_output.topk_ids
 
@@ -595,6 +614,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if self.enable_shared_expert_fusion and TopKOutputChecker.format_is_standard(
             topk_output
         ):
+            assert False, "make sure code never reaches here"
             topk_output = self._append_shared_to_topk_output(topk_output, hidden_states)
         return self.experts(hidden_states, topk_output)
 
