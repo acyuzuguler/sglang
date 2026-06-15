@@ -214,9 +214,12 @@ class Cache:
     def __init__(self, layer_id, rid, capacity) -> None:
         self.capacity = capacity
         self._dat = OrderedDict()
+        self.prefetched = []
         self.init_random()
         self.n_hits = 0
         self.n_miss = 0
+        self.n_corr_pref = 0
+        self.n_pref = 0
         self.layer_id = layer_id
         self.rid = rid
 
@@ -231,13 +234,18 @@ class Cache:
         if len(self._dat) == self.capacity:
             self._dat.popitem(last=False)
 
-    def read(self, experts, is_decode):
-        hits = [e for e in experts if e in self._dat]
-        misses = [e for e in experts if e not in hits]
+    def prefetch(self, prefetch_experts):
+        self.prefetched = prefetch_experts
 
+    def read(self, experts, is_decode):
+        hits = [e for e in experts if e in self._dat or e in self.prefetched]
+        misses = [e for e in experts if e not in hits]
+        
         if is_decode:
             self.n_hits += len(hits)
             self.n_miss += len(misses)
+            self.n_pref += len(self.prefetched)
+            self.n_corr_pref += len([e for e in self.prefetched if e in hits])
 
         for e in experts:
             if e in self._dat:
@@ -249,7 +257,7 @@ class Cache:
         return hits
     
     def get_experts_in_cache(self):
-        return list(self._dat.keys())
+        return list(set(list(self._dat.keys()) + self.prefetched))
     
     def flush(self):
         with open(os.path.join(EXP_DIR, "cache_stats.jsonl"), "a") as f:
@@ -261,6 +269,8 @@ class Cache:
                     "rid": self.rid,
                     "n_hits": self.n_hits,
                     "n_miss": self.n_miss,
+                    "n_corr_pref": self.n_corr_pref,
+                    "n_pref": self.n_pref,
                     "hit_ratio": hit_ratio
                 }
             ))
@@ -309,14 +319,21 @@ class CacheAwareTopk(torch.nn.Module):
             
             ar = torch.arange(num_experts, device=topks.device).unsqueeze(0)
 
-            cache_mask = torch.nn.functional.one_hot(torch.tensor(cached_experts, device=topks.device) , num_classes=num_experts).sum(dim=1).bool()
+            # cache_mask = torch.nn.functional.one_hot(torch.tensor(cached_experts, device=topks.device) , num_classes=num_experts).sum(dim=1).bool()
+            # cache_mask[i, e] == True iff expert e is cached/prefetched for token i  (ragged-safe)
+            lengths  = torch.tensor([len(c) for c in cached_experts], device=topks.device)
+            col_idx  = torch.tensor([e for c in cached_experts for e in c],
+                                    dtype=torch.long, device=topks.device)
+            row_idx  = torch.repeat_interleave(
+                torch.arange(n_tokens, device=topks.device), lengths)
+            cache_mask = torch.zeros(n_tokens, num_experts, dtype=torch.bool, device=topks.device)
+            cache_mask[row_idx, col_idx] = True
 
             # is the expert at sorted-position j cached for this token?
             cached_at_pos = torch.gather(cache_mask, 1, topks).contiguous()              # [n_tokens, K] bool
 
             # keep: first FIXED_EXPERTS always, plus cached ones among the rest
-            fixed_num_experts = 2
-            keep = (ar < fixed_num_experts) | cached_at_pos                    # [n_tokens, K]
+            keep = (ar < self.fixed_num_experts) | cached_at_pos                    # [n_tokens, K]
 
             # stable partition: kept positions keep their order up front, rest pushed back
             sort_key = torch.where(keep, ar, ar + num_experts)
@@ -336,6 +353,44 @@ class CacheAwareTopk(torch.nn.Module):
             )
 
         return out
+
+class EarlyGate:
+    def __init__(self):
+        self.gates = {}
+        self.preds = {}
+        self.prefetch_offset = exp_args["prefetch_offset"]
+        self.n_preds = exp_args["n_prefetch"]
+        self.topk = TopK(
+                top_k=self.n_preds,
+                renormalize=True,
+                layer_id=0,
+        )
+        self.is_enabled = self.n_preds > 0
+
+    def add_gate(self, layer_id, gate):
+        if not self.is_enabled: return 
+        assert layer_id not in self.gates
+        self.gates[layer_id] = gate
+
+    def make_pred(self, layer_id, hidden_states):
+        if not self.is_enabled: return 
+
+        next_layer_id = layer_id+self.prefetch_offset
+        if next_layer_id in self.gates:
+            next_gate = self.gates[next_layer_id]
+            router_logits, _ = next_gate(hidden_states)
+            self.preds[next_layer_id] = self.topk(hidden_states, router_logits).topk_ids
+
+    def get_pred(self, layer_id):
+        if not self.is_enabled: return None
+
+        if layer_id in self.preds:
+            return self.preds[layer_id].tolist()
+        else:
+            return None
+
+global early_gate
+early_gate = EarlyGate()
 
 class Qwen2MoeSparseMoeBlock(nn.Module):
     def __init__(
@@ -427,6 +482,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             quant_config=None,
             prefix=add_prefix("gate", prefix),
         )
+        early_gate.add_gate(layer_id, self.gate)
+
         # When enable_shared_expert_fusion, the shared expert runs inside the MoE kernel
         # (via _append_shared_to_topk_output); a separate shared_expert MLP would
         # double-count. If fusion is off (num_fused_shared_experts == 0), keep shared_expert.
@@ -586,10 +643,16 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     def _forward_router_experts(self, hidden_states: torch.Tensor, forward_batch: Optional[ForwardBatch] = None,):
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
+        early_gate.make_pred(self.layer_id, hidden_states)
+
         num_tokens, n_experts = router_logits.shape 
         is_decode = forward_batch.batch_size == num_tokens
         
         if is_decode:
+            prefetch_experts = early_gate.get_pred(self.layer_id)
+            if prefetch_experts:
+                for i, rid in enumerate(forward_batch.rids): self.cache[rid].prefetch(prefetch_experts[i])
+            
             cached_experts = [self.cache[rid].get_experts_in_cache() for rid in forward_batch.rids]
         else:
             cached_experts = None
