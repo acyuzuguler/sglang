@@ -210,35 +210,77 @@ EXP_DIR = os.getenv("EXP_DIR", os.path.join(os.path.abspath(os.path.curdir), "ev
 with open(os.path.join(EXP_DIR, "exp_args.json"), "r") as f:
     exp_args = json.load(f)
 
+class CacheRegistry:
+    _reg = {}
+
+    @staticmethod
+    def add(cache):
+        layer_id = cache.layer_id
+        rid = cache.rid
+        if rid not in CacheRegistry._reg: CacheRegistry._reg[rid] = {}
+        assert layer_id not in CacheRegistry._reg[rid], f"cache with rid={rid} and layer_id={layer_id} already exists in registry."
+        CacheRegistry._reg[rid][layer_id] = cache
+
+    @staticmethod
+    def get(rid, layer_id):
+        assert rid in CacheRegistry._reg, f"rid={rid} not in registry."
+        assert layer_id in CacheRegistry._reg[rid], f"rid={rid}, layer_id={layer_id} not in registry."
+        return CacheRegistry._reg[rid][layer_id]
+    
 class Cache:
-    def __init__(self, layer_id, rid, capacity) -> None:
-        self.capacity = capacity
-        self._dat = OrderedDict()
+    def __init__(self, layer_id, rid, num_experts, static_cap, dynamic_cap, record_activations=False) -> None:
+        self.static_cap = static_cap
+        self.static_dat = OrderedDict()
+        self.dynamic_cap = dynamic_cap
+        self.dynamic_dat = OrderedDict()
+
         self.prefetched = []
         self.init_random()
+
         self.n_hits = 0
         self.n_miss = 0
         self.n_corr_pref = 0
         self.n_pref = 0
         self.layer_id = layer_id
         self.rid = rid
+        self.num_experts = num_experts
+        self.static_stats = {e: 0 for e in range(self.num_experts)}
+        self.record_activations = record_activations
+        self.activations = []
 
     def __exit__(self, exc_type, exc, tb):
         print(f"Cache {self.layer_id} for {self.rid} exited")
 
     def init_random(self):
-        for e in range(self.capacity):
-            self._dat[e] = 0
+        for e in range(self.dynamic_cap):
+            self.dynamic_dat[e] = 0
 
     def evict(self):
-        if len(self._dat) == self.capacity:
-            self._dat.popitem(last=False)
+        if self.dynamic_cap == 0: return
+        if len(self.dynamic_dat) == self.dynamic_cap:
+            self.dynamic_dat.popitem(last=False)
+
+    def populate_static(self, experts):
+        if exp_args["hot_experts_file"]:
+            with open(exp_args["hot_experts_file"], "r") as f:
+                _hot_experts = json.load(f)[str(self.layer_id)]
+                hot_experts = sorted(list(range(self.num_experts)), key=lambda e: _hot_experts[str(e)], reverse=True)
+        else:
+            for e in experts: self.static_stats[e] += 1
+            hot_experts = sorted(list(range(self.num_experts)), key=lambda e: self.static_stats[e], reverse=True)
+        
+        assert len(self.static_dat) == 0
+        for e in hot_experts[:self.static_cap]:
+            print(e, _hot_experts[str(e)])
+            self.static_dat[e] = 0
+
+        assert len(self.static_dat) == 8
 
     def prefetch(self, prefetch_experts):
         self.prefetched = prefetch_experts
 
     def read(self, experts, is_decode):
-        hits = [e for e in experts if e in self._dat or e in self.prefetched]
+        hits = [e for e in experts if e in self.static_dat or e in self.dynamic_dat or e in self.prefetched]
         misses = [e for e in experts if e not in hits]
         
         if is_decode:
@@ -246,20 +288,30 @@ class Cache:
             self.n_miss += len(misses)
             self.n_pref += len(self.prefetched)
             self.n_corr_pref += len([e for e in self.prefetched if e in hits])
+            if self.record_activations:
+                self.activations.append(
+                    {
+                        "active_experts": experts,
+                        "in_cache": list(self.static_dat.keys()) + list(self.dynamic_dat.keys()),
+                        "prefetched": self.prefetched
+                    }
+                )
 
         for e in experts:
-            if e in self._dat:
-                self._dat.move_to_end(e)
+            if e in self.static_dat:
+                pass
+            elif e in self.dynamic_dat:
+                self.dynamic_dat.move_to_end(e)
             else:
                 self.evict()
-                self._dat[e] = 0
+                self.dynamic_dat[e] = 0
         
         return hits
     
     def get_experts_in_cache(self):
-        return list(set(list(self._dat.keys()) + self.prefetched))
+        return list(set(list(self.static_dat.keys()) + list(self.dynamic_dat.keys()) + self.prefetched))
     
-    def flush(self):
+    def dump_cache_stats(self):
         with open(os.path.join(EXP_DIR, "cache_stats.jsonl"), "a") as f:
             total = self.n_hits + self.n_miss
             hit_ratio = self.n_hits / total if total > 0 else 0
@@ -276,15 +328,30 @@ class Cache:
             ))
             f.write("\n")
 
+    def dump_activations(self):
+        with open(os.path.join(EXP_DIR, "active_experts.jsonl"), "a") as f:
+            f.write(json.dumps(
+                {
+                    "layer_id": self.layer_id,
+                    "rid": self.rid,
+                    "data": self.activations
+                }
+            ))
+            f.write("\n")
+
+    def flush(self):
+        self.dump_cache_stats()
+        if self.record_activations:
+            self.dump_activations()
 
 class CacheAwareTopk(torch.nn.Module):
-    def __init__(self, top_k, renormalize, layer_id) -> None:
+    def __init__(self, top_k, renormalize, layer_id, fixed_num_experts) -> None:
         super().__init__()
         assert renormalize == True, "renormalize == False is not yet supported" 
         self.topk = top_k
         self.renormalize = renormalize
         self.layer_id = layer_id
-        self.fixed_num_experts = exp_args["fixed_num_experts"]
+        self.fixed_num_experts = fixed_num_experts
 
     def forward(self, hidden_states, router_logits, cached_experts=None):
         if cached_experts is None:
@@ -354,16 +421,23 @@ class CacheAwareTopk(torch.nn.Module):
 
         return out
 
+
+RIDS = []
+
+
+
+
 class EarlyGate:
     def __init__(self):
         self.gates = {}
         self.preds = {}
         self.prefetch_offset = exp_args["prefetch_offset"]
         self.n_preds = exp_args["n_prefetch"]
-        self.topk = TopK(
-                top_k=self.n_preds,
-                renormalize=True,
-                layer_id=0,
+        self.topk = CacheAwareTopk(
+            top_k=self.n_preds,
+            renormalize=True,
+            layer_id=0,
+            fixed_num_experts=0
         )
         self.is_enabled = self.n_preds > 0
 
@@ -372,14 +446,19 @@ class EarlyGate:
         assert layer_id not in self.gates
         self.gates[layer_id] = gate
 
-    def make_pred(self, layer_id, hidden_states):
+    def make_pred(self, layer_id, hidden_states, rids):
         if not self.is_enabled: return 
 
         next_layer_id = layer_id+self.prefetch_offset
         if next_layer_id in self.gates:
+            num_experts = self.gates[next_layer_id].output_size
+        
+            cached_experts = [CacheRegistry.get(rid, next_layer_id).get_experts_in_cache() for rid in rids]
+            not_cached_experts = [[e for e in range(num_experts) if e not in cached_experts[i]] for i in range(len(cached_experts))]
+
             next_gate = self.gates[next_layer_id]
             router_logits, _ = next_gate(hidden_states)
-            self.preds[next_layer_id] = self.topk(hidden_states, router_logits).topk_ids
+            self.preds[next_layer_id] = self.topk(hidden_states, router_logits, not_cached_experts).topk_ids
 
     def get_pred(self, layer_id):
         if not self.is_enabled: return None
@@ -445,12 +524,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             self.topk = CacheAwareTopk(
                 top_k=config.num_experts_per_tok,
                 renormalize=config.norm_topk_prob,
-                layer_id=layer_id,            
+                layer_id=layer_id,
+                fixed_num_experts=exp_args["fixed_num_experts"]     
             )
         else:
             raise NotImplementedError
 
-        self.cache_cap = exp_args["cache_capacity"]
         self.cache = {}
 
         self.experts = get_moe_impl_class(quant_config)(
@@ -643,17 +722,19 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     def _forward_router_experts(self, hidden_states: torch.Tensor, forward_batch: Optional[ForwardBatch] = None,):
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        early_gate.make_pred(self.layer_id, hidden_states)
 
         num_tokens, n_experts = router_logits.shape 
         is_decode = forward_batch.batch_size == num_tokens
         
         if is_decode:
+            early_gate.make_pred(self.layer_id, hidden_states, forward_batch.rids)
             prefetch_experts = early_gate.get_pred(self.layer_id)
             if prefetch_experts:
-                for i, rid in enumerate(forward_batch.rids): self.cache[rid].prefetch(prefetch_experts[i])
+                for i, rid in enumerate(forward_batch.rids): 
+                    self.cache[rid].prefetch(prefetch_experts[i])
             
             cached_experts = [self.cache[rid].get_experts_in_cache() for rid in forward_batch.rids]
+            assert len(cached_experts) == 8
         else:
             cached_experts = None
 
@@ -662,17 +743,27 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         else:
             # cached_experts = [[e for e in range(256)] for _ in range(num_tokens)]
             # cached_experts = None
+            
             topk_output = self.topk(hidden_states, router_logits, cached_experts)
         selected = topk_output.topk_ids
 
         n_tokens = selected.shape[0]
 
         if is_decode: assert n_tokens == len(forward_batch.rids)
+        if not is_decode: assert len(forward_batch.rids) == 1
 
         for i, rid in enumerate(forward_batch.rids):
+            if rid not in RIDS: RIDS.append(rid)
+
             if rid not in self.cache:
-                self.cache[rid] = Cache(self.layer_id, rid, self.cache_cap)
+                record_activations = False if len(RIDS) <= 1 else rid == RIDS[1]
+                self.cache[rid] = Cache(self.layer_id, rid, self.num_experts, exp_args["cache_static_cap"], exp_args["cache_dynamic_cap"], record_activations=record_activations)
+                CacheRegistry.add(self.cache[rid])
+
             self.cache[rid].read(selected[i].tolist(), is_decode)
+
+            if not is_decode:
+                self.cache[rid].populate_static(selected.flatten().tolist())
 
         if self.enable_shared_expert_fusion and TopKOutputChecker.format_is_standard(
             topk_output
