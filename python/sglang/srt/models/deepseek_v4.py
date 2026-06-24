@@ -1711,6 +1711,10 @@ class DeepseekV4ForCausalLM(nn.Module):
             num_groups=None,
         )
 
+    def flush_cache(self, rid):
+        for layer in self.model.layers:
+            layer.mlp.flush_cache(rid)
+
 
 EntryClass = [DeepseekV4ForCausalLM]
 

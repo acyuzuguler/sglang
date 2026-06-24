@@ -704,6 +704,8 @@ class DeepseekV2MoE(nn.Module):
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.mega_moe import forward_mega_moe, should_use_mega_moe
 
+        self.cache = {}
+
         if should_use_mega_moe(self, hidden_states):
             return forward_mega_moe(
                 self,
@@ -1304,6 +1306,10 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states *= self.routed_scaling_factor
 
         state.hidden_states_mlp_output = final_hidden_states
+
+    def flush_cache(self, rid):
+        if rid in self.cache:
+            self.cache[rid].flush()
 
 
 class DeepseekV2AttentionMLA(
