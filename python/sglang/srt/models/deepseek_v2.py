@@ -650,18 +650,20 @@ class EarlyGate:
         self.preds = {}
         self.prefetch_offset = exp_args["prefetch_offset"]
         self.n_preds = exp_args["n_prefetch"]
-        self.topk = CacheAwareTopk(
-            top_k=self.n_preds,
-            renormalize=True,
-            layer_id=0,
-            fixed_num_experts=0
-        )
+        self.topks = {}
         self.is_enabled = self.n_preds > 0
 
-    def add_gate(self, layer_id, gate):
+    def add_gate(self, layer_id, gate, correction_bias):
         if not self.is_enabled: return 
         assert layer_id not in self.gates
         self.gates[layer_id] = gate
+        self.topks[layer_id] = CacheAwareTopk(
+            top_k=self.n_preds,
+            renormalize=True,
+            layer_id=0,
+            fixed_num_experts=0,
+            correction_bias=correction_bias
+        )
 
     def make_pred(self, layer_id, hidden_states, rids):
         if not self.is_enabled: return 
@@ -675,7 +677,7 @@ class EarlyGate:
 
             next_gate = self.gates[next_layer_id]
             router_logits, _ = next_gate(hidden_states)
-            self.preds[next_layer_id] = self.topk(hidden_states, router_logits, not_cached_experts).topk_ids
+            self.preds[next_layer_id] = self.topks[next_layer_id](hidden_states, router_logits, not_cached_experts).topk_ids
 
     def get_pred(self, layer_id):
         if not self.is_enabled: return None
