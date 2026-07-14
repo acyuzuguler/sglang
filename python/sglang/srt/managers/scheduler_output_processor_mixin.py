@@ -20,6 +20,7 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
 )
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
+from sglang.srt.model_executor.model_runner import CacheRegistry
 from sglang.srt.server_args import MIS_DELIMITER_TOKEN_ID, get_global_server_args
 from sglang.srt.state_capturer.indexer_topk import (
     get_global_indexer_capturer,
@@ -646,7 +647,6 @@ class SchedulerOutputProcessorMixin:
                 req.multimodal_inputs.release_features()
             self.maybe_collect_routed_experts(req)
             self.maybe_collect_indexer_topk(req)
-            self.tp_worker.model_runner.model.flush_cache(req.rid)
             
             if self.server_args.disaggregation_decode_enable_offload_kvcache:
                 # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
@@ -657,6 +657,7 @@ class SchedulerOutputProcessorMixin:
                     self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(req, self.tree_cache)
 
+            CacheRegistry.flush_rid(req.rid)
             req.time_stats.set_completion_time()
 
         self.maybe_collect_customized_info(i, req, logits_output)

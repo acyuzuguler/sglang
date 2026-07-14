@@ -3307,6 +3307,79 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ) -> ModelRunnerOutput:
         self.forward_pass_id += 1
 
+        num_layers = self.model.config.num_hidden_layers
+        num_experts = self.model.config.num_experts if hasattr(self.model.config, "num_experts") else self.model.config.n_routed_experts
+        num_experts_per_tok = self.model.config.num_experts_per_tok
+
+        is_decode = forward_batch.forward_mode == ForwardMode.DECODE
+        if is_decode: assert forward_batch.batch_size == len(forward_batch.rids), f"{forward_batch.batch_size} vs {len(forward_batch.rids)}"
+        for rid in forward_batch.rids: 
+            if rid not in _RIDS: 
+                _RIDS.append(rid)
+
+
+        if self.graph_runner is not None:
+            mask_buffers = self.graph_runner.cached_experts_mask
+            selected_expert_ids = self.graph_runner.selected_expert_ids
+            early_gate_preds = self.graph_runner.early_gate_preds
+        else:
+            if not hasattr(self, "_cache_buffers"):
+                max_bsz = 256
+                n_preds = exp_args["n_prefetch"]
+                self._cache_buffers = {
+                    "cached_experts_mask": {
+                        layer_id: torch.zeros((max_bsz, num_experts), dtype=torch.bool, device=self.device)
+                        for layer_id in range(num_layers)
+                    },
+                    "selected_expert_ids": {
+                        layer_id: torch.zeros((max_bsz, num_experts_per_tok), dtype=torch.int32, device=self.device)
+                        for layer_id in range(num_layers)
+                    },
+                    "early_gate_preds": {
+                        layer_id: torch.full(
+                            (max_bsz, n_preds), -1,
+                            dtype=torch.int32,
+                            device=self.device,
+                        )
+                        for layer_id in range(num_layers)
+                    },
+                }
+            mask_buffers = self._cache_buffers["cached_experts_mask"]
+            selected_expert_ids = self._cache_buffers["selected_expert_ids"]
+            early_gate_preds = self._cache_buffers["early_gate_preds"]
+
+        for layer_id in range(num_layers):
+            buf = mask_buffers[layer_id]
+            buf.zero_()  # captured as a GPU op only if executed inside the graph;
+                        # here it's outside the graph, so it's just an eager kernel — fine.
+
+            rows, cols = [], []
+            for i, rid in enumerate(forward_batch.rids):
+                if not CacheRegistry.is_exist(rid, layer_id):
+                    record_activations = rid == _RIDS[0]
+                    cache = Cache(layer_id, rid, num_experts,
+                                exp_args["cache_static_cap"],
+                                exp_args["cache_dynamic_cap"],
+                                record_activations=record_activations)
+                    CacheRegistry.add(cache)
+                else:
+                    cache = CacheRegistry.get(rid, layer_id)
+                for e in cache.get_experts_in_cache():
+                    rows.append(i)
+                    cols.append(e)
+
+            if rows:
+                row_t = torch.tensor(rows, dtype=torch.long, device=self.device)
+                col_t = torch.tensor(cols, dtype=torch.long, device=self.device)
+                buf[row_t, col_t] = True  # in-place scatter into the persistent buffer
+
+        forward_batch.cached_experts = mask_buffers
+        forward_batch.selected_expert_ids = selected_expert_ids
+        forward_batch.early_gate_preds = early_gate_preds
+
+        if not is_decode:
+            forward_batch.selected_expert_ids_prefill = {}
+
         # Try msprob debugger
         if self.msprobe_debugger is not None:
             rank_id = (
@@ -3374,6 +3447,38 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.server_args.elastic_ep_backend is not None:
             self.maybe_recover_ep_ranks()
+
+
+        for layer_id in range(num_layers):
+            if is_decode:
+                sel_cpu = forward_batch.selected_expert_ids[layer_id][:forward_batch.batch_size].tolist()
+                for i, rid in enumerate(forward_batch.rids):
+                    CacheRegistry.get(rid, layer_id).read(sel_cpu[i], is_decode)
+            else:
+                # prefill: row range [start : start + seq_len) per request
+                sel = forward_batch.selected_expert_ids_prefill[layer_id].tolist()
+                seq_lens = forward_batch.extend_seq_lens_cpu  # List[int], no GPU sync
+                start = 0
+                for rid, seq_len in zip(forward_batch.rids, seq_lens):
+                    end = start + seq_len
+                    token_rows = sel[start:end]                 # List[List[int]], [seq_len][top_k]
+                    cache = CacheRegistry.get(rid, layer_id)
+                    for row in token_rows:
+                        cache.read(row, is_decode=False)
+                    start = end
+
+        if is_decode:
+            for layer_id in range(num_layers):
+                if layer_id < exp_args["prefetch_offset"]:
+                    continue
+                preds_cpu = forward_batch.early_gate_preds[layer_id][: forward_batch.batch_size].tolist()
+                for i, rid in enumerate(forward_batch.rids):
+                    row = preds_cpu[i]
+                    if row and row[0] < 0:
+                        continue  # layer has no early gate (dsv4 hash layers) — buffer never written
+                    CacheRegistry.get(rid, layer_id).prefetch(row)
+
+        # ForkedPdb().set_trace()
 
         return output
 
@@ -3673,3 +3778,181 @@ class LocalSerializedTensor:
 
     def get(self, rank: int):
         return MultiprocessingSerializer.deserialize(self.values[rank])
+
+
+import json 
+EXP_DIR = os.getenv("EXP_DIR", os.path.join(os.path.abspath(os.path.curdir), "eval/experiments/tmp"))
+with open(os.path.join(EXP_DIR, "exp_args.json"), "r") as f:
+    exp_args = json.load(f)
+
+class CacheRegistry:
+    _reg = {}
+
+    @staticmethod
+    def is_exist(rid, layer_id):
+        if rid not in CacheRegistry._reg: return False
+        if layer_id not in CacheRegistry._reg[rid]: return False
+        return True 
+    
+    @staticmethod
+    def add(cache):
+        layer_id = cache.layer_id
+        rid = cache.rid
+        if rid not in CacheRegistry._reg: CacheRegistry._reg[rid] = {}
+        assert layer_id not in CacheRegistry._reg[rid], f"cache with rid={rid} and layer_id={layer_id} already exists in registry."
+        CacheRegistry._reg[rid][layer_id] = cache
+
+    @staticmethod
+    def get(rid, layer_id):
+        assert rid in CacheRegistry._reg, f"rid={rid} not in registry."
+        assert layer_id in CacheRegistry._reg[rid], f"rid={rid}, layer_id={layer_id} not in registry."
+        return CacheRegistry._reg[rid][layer_id]
+
+    @staticmethod
+    def flush_rid(rid):
+        if rid not in CacheRegistry._reg:
+            return
+        for cache in CacheRegistry._reg[rid].values():
+            cache.flush()
+        del CacheRegistry._reg[rid]
+    
+class Cache:
+    def __init__(self, layer_id, rid, num_experts, static_cap, dynamic_cap, record_activations=False) -> None:
+        from collections import OrderedDict
+        
+        self.static_cap = static_cap
+        self.static_dat = OrderedDict()
+        self.dynamic_cap = dynamic_cap
+        self.dynamic_dat = OrderedDict()
+
+        self.prefetched = []
+        
+        self.n_hits = 0
+        self.n_miss = 0
+        self.n_corr_pref = 0
+        self.n_pref = 0
+        self.layer_id = layer_id
+        self.rid = rid
+        self.num_experts = num_experts
+        self.static_stats = {e: 0 for e in range(self.num_experts)}
+        self.record_activations = record_activations
+        self.activations = []
+        
+        self.hot_stats = {e: 0 for e in range(num_experts)}
+
+        self.init_random()
+
+    def __exit__(self, exc_type, exc, tb):
+        print(f"Cache {self.layer_id} for {self.rid} exited")
+
+    def init_random(self):
+        if self.static_cap > 0:
+            with open(exp_args["hot_experts_file"], "r") as f:
+                _hot_experts = json.load(f)[str(self.layer_id)]
+                hot_experts = sorted(list(range(self.num_experts)), key=lambda e: _hot_experts[str(e)], reverse=True)
+            for e in hot_experts[:self.static_cap]:
+                self.static_dat[e] = 0
+
+        for e in range(self.dynamic_cap):
+            self.dynamic_dat[e] = 0
+
+    def evict(self):
+        if len(self.dynamic_dat) == self.dynamic_cap:
+            self.dynamic_dat.popitem(last=False)
+
+    def prefetch(self, prefetch_experts):
+        self.prefetched = prefetch_experts
+
+    def read(self, experts, is_decode):
+        hits = [e for e in experts if e in self.static_dat or e in self.dynamic_dat or e in self.prefetched]
+        misses = [e for e in experts if e not in hits]
+        
+        if is_decode:
+            for e in experts: self.hot_stats[e] += 1
+            
+            self.n_hits += len(hits)
+            self.n_miss += len(misses)
+            self.n_pref += len(self.prefetched)
+            self.n_corr_pref += len([e for e in self.prefetched if e in hits])
+            if self.record_activations:
+                self.activations.append(
+                    {
+                        "active_experts": experts,
+                        "in_cache": list(self.static_dat.keys()) + list(self.dynamic_dat.keys()),
+                        "prefetched": self.prefetched
+                    }
+                )
+
+        if self.dynamic_cap > 0:
+            for e in experts:
+                if e in self.static_dat:
+                    pass
+                elif e in self.dynamic_dat:
+                    self.dynamic_dat.move_to_end(e)
+                else:
+                    self.evict()
+                    self.dynamic_dat[e] = 0
+        
+        return hits
+    
+    def get_experts_in_cache(self):
+        return list(set(list(self.static_dat.keys()) + list(self.dynamic_dat.keys()) + self.prefetched))
+    
+    def dump_hot_stats(self):
+        with open(os.path.join(EXP_DIR, "hot_stats.jsonl"), "a") as f:
+            f.write(json.dumps(
+                {
+                    "layer_id": self.layer_id,
+                    "rid": self.rid,
+                    "hot_stats": self.hot_stats
+                }
+            ))
+            f.write("\n")
+
+    def dump_cache_stats(self):
+        with open(os.path.join(EXP_DIR, "cache_stats.jsonl"), "a") as f:
+            total = self.n_hits + self.n_miss
+            hit_ratio = self.n_hits / total if total > 0 else 0
+            f.write(json.dumps(
+                {
+                    "layer_id": self.layer_id,
+                    "rid": self.rid,
+                    "n_hits": self.n_hits,
+                    "n_miss": self.n_miss,
+                    "n_corr_pref": self.n_corr_pref,
+                    "n_pref": self.n_pref,
+                    "hit_ratio": hit_ratio
+                }
+            ))
+            f.write("\n")
+
+    def dump_activations(self):
+        with open(os.path.join(EXP_DIR, "active_experts.jsonl"), "a") as f:
+            f.write(json.dumps(
+                {
+                    "layer_id": self.layer_id,
+                    "rid": self.rid,
+                    "data": self.activations
+                }
+            ))
+            f.write("\n")
+
+    def flush(self):
+        self.dump_cache_stats()
+        self.dump_hot_stats()
+        if self.record_activations:
+            self.dump_activations()
+
+_RIDS = []
+
+
+import pdb
+import sys
+class ForkedPdb(pdb.Pdb):
+    def interaction(self, *args, **kwargs):
+        stdin = sys.stdin
+        try:
+            sys.stdin = open("/dev/stdin")
+            super().interaction(*args, **kwargs)
+        finally:
+            sys.stdin = stdin

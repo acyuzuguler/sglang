@@ -574,6 +574,10 @@ def _default_make_graph_key(bs, stream_idx=None, variant_label=None):
         key = f"{variant_label}_{key}"
     return key
 
+import json 
+EXP_DIR = os.getenv("EXP_DIR", os.path.join(os.path.abspath(os.path.curdir), "eval/experiments/tmp"))
+with open(os.path.join(EXP_DIR, "exp_args.json"), "r") as f:
+    exp_args = json.load(f)
 
 class CudaGraphRunner:
     """A CudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
@@ -729,6 +733,38 @@ class CudaGraphRunner:
         self.buffers.share_buffers()
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
+
+        num_layers = model_runner.model.config.num_hidden_layers
+        num_experts_per_tok = model_runner.model.config.num_experts_per_tok
+        max_bsz = 256
+        self.selected_expert_ids = {
+            layer_id: torch.zeros(
+                (max_bsz, num_experts_per_tok),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            for layer_id in range(num_layers)
+        }
+
+        num_experts = model_runner.model.config.num_experts if hasattr(model_runner.model.config, "num_experts") else model_runner.model.config.n_routed_experts
+        self.cached_experts_mask = {
+            layer_id: torch.zeros(
+                (max_bsz, num_experts),
+                dtype=torch.bool,
+                device=self.device,
+            )
+            for layer_id in range(num_layers)
+        }
+
+        n_preds = exp_args["n_prefetch"]
+        self.early_gate_preds = {
+            layer_id: torch.full(
+                (max_bsz, n_preds), -1,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            for layer_id in range(num_layers)
+        }
 
         # Capture
         try:
@@ -1112,6 +1148,10 @@ class CudaGraphRunner:
             lora_ids=lora_ids,
         )
 
+        forward_batch.selected_expert_ids = self.selected_expert_ids
+        forward_batch.cached_experts = self.cached_experts_mask
+        forward_batch.early_gate_preds = self.early_gate_preds
+        
         # HiSparse: set coordinator so the hisparse code path is captured into the graph
         forward_batch.hisparse_coordinator = self.model_runner.hisparse_coordinator
         if forward_batch.hisparse_coordinator is not None:

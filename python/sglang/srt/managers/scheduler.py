@@ -1421,6 +1421,25 @@ class Scheduler(
             get_int_env_var(env_var, default_size) if env_var else None
         )
 
+        # A chunk smaller than truncation_align_size can never pass the
+        # alignment check in PrefillAdder.add_one_req, so any request longer
+        # than chunked_prefill_size would be retried forever at the head of
+        # the waiting queue and livelock the scheduler. Bump the chunk size
+        # to the alignment size to keep chunked prefill schedulable.
+        if (
+            self.truncation_align_size is not None
+            and self.chunked_prefill_size is not None
+            and self.chunked_prefill_size < self.truncation_align_size
+        ):
+            logger.warning(
+                f"chunked_prefill_size ({self.chunked_prefill_size}) is smaller than "
+                f"the deterministic-inference truncation_align_size "
+                f"({self.truncation_align_size}); raising chunked_prefill_size to "
+                f"{self.truncation_align_size} to avoid a scheduling livelock for "
+                f"requests longer than the chunk size."
+            )
+            self.chunked_prefill_size = self.truncation_align_size
+
     def init_request_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
             [

@@ -1436,10 +1436,6 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
 
         return loaded_params
 
-    def flush_cache(self, rid):
-        for layer in self.layers:
-            layer.mlp.flush_cache(rid)
-
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
@@ -1976,8 +1972,5 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             num_logical_experts=text_config.num_experts,
             num_groups=None,
         )
-
-    def flush_cache(self, rid):
-        self.model.flush_cache(rid)
 
 EntryClass = [Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]

@@ -202,154 +202,13 @@ class Qwen2MoeMLP(nn.Module):
         )
         return x
 
-from collections import OrderedDict
+
 import json 
 import os 
 
 EXP_DIR = os.getenv("EXP_DIR", os.path.join(os.path.abspath(os.path.curdir), "eval/experiments/tmp"))
 with open(os.path.join(EXP_DIR, "exp_args.json"), "r") as f:
     exp_args = json.load(f)
-
-class CacheRegistry:
-    _reg = {}
-
-    @staticmethod
-    def add(cache):
-        layer_id = cache.layer_id
-        rid = cache.rid
-        if rid not in CacheRegistry._reg: CacheRegistry._reg[rid] = {}
-        assert layer_id not in CacheRegistry._reg[rid], f"cache with rid={rid} and layer_id={layer_id} already exists in registry."
-        CacheRegistry._reg[rid][layer_id] = cache
-
-    @staticmethod
-    def get(rid, layer_id):
-        assert rid in CacheRegistry._reg, f"rid={rid} not in registry."
-        assert layer_id in CacheRegistry._reg[rid], f"rid={rid}, layer_id={layer_id} not in registry."
-        return CacheRegistry._reg[rid][layer_id]
-    
-class Cache:
-    def __init__(self, layer_id, rid, num_experts, static_cap, dynamic_cap, record_activations=False) -> None:
-        self.static_cap = static_cap
-        self.static_dat = OrderedDict()
-        self.dynamic_cap = dynamic_cap
-        self.dynamic_dat = OrderedDict()
-
-        self.prefetched = []
-        
-        self.n_hits = 0
-        self.n_miss = 0
-        self.n_corr_pref = 0
-        self.n_pref = 0
-        self.layer_id = layer_id
-        self.rid = rid
-        self.num_experts = num_experts
-        self.static_stats = {e: 0 for e in range(self.num_experts)}
-        self.record_activations = record_activations
-        self.activations = []
-        
-        self.hot_stats = {e: 0 for e in range(num_experts)}
-
-        self.init_random()
-
-    def __exit__(self, exc_type, exc, tb):
-        print(f"Cache {self.layer_id} for {self.rid} exited")
-
-    def init_random(self):
-        with open(exp_args["hot_experts_file"], "r") as f:
-            _hot_experts = json.load(f)[str(self.layer_id)]
-            hot_experts = sorted(list(range(self.num_experts)), key=lambda e: _hot_experts[str(e)], reverse=True)
-        for e in hot_experts[:self.static_cap]:
-            self.static_dat[e] = 0
-
-        for e in range(self.dynamic_cap):
-            self.dynamic_dat[e] = 0
-
-    def evict(self):
-        if len(self.dynamic_dat) == self.dynamic_cap:
-            self.dynamic_dat.popitem(last=False)
-
-    def prefetch(self, prefetch_experts):
-        self.prefetched = prefetch_experts
-
-    def read(self, experts, is_decode):
-        hits = [e for e in experts if e in self.static_dat or e in self.dynamic_dat or e in self.prefetched]
-        misses = [e for e in experts if e not in hits]
-        
-        if is_decode:
-            for e in experts: self.hot_stats[e] += 1
-            
-            self.n_hits += len(hits)
-            self.n_miss += len(misses)
-            self.n_pref += len(self.prefetched)
-            self.n_corr_pref += len([e for e in self.prefetched if e in hits])
-            if self.record_activations:
-                self.activations.append(
-                    {
-                        "active_experts": experts,
-                        "in_cache": list(self.static_dat.keys()) + list(self.dynamic_dat.keys()),
-                        "prefetched": self.prefetched
-                    }
-                )
-
-        if self.dynamic_cap > 0:
-            for e in experts:
-                if e in self.static_dat:
-                    pass
-                elif e in self.dynamic_dat:
-                    self.dynamic_dat.move_to_end(e)
-                else:
-                    self.evict()
-                    self.dynamic_dat[e] = 0
-        
-        return hits
-    
-    def get_experts_in_cache(self):
-        return list(set(list(self.static_dat.keys()) + list(self.dynamic_dat.keys()) + self.prefetched))
-    
-    def dump_hot_stats(self):
-        with open(os.path.join(EXP_DIR, "hot_stats.jsonl"), "a") as f:
-            f.write(json.dumps(
-                {
-                    "layer_id": self.layer_id,
-                    "rid": self.rid,
-                    "hot_stats": self.hot_stats
-                }
-            ))
-            f.write("\n")
-
-    def dump_cache_stats(self):
-        with open(os.path.join(EXP_DIR, "cache_stats.jsonl"), "a") as f:
-            total = self.n_hits + self.n_miss
-            hit_ratio = self.n_hits / total if total > 0 else 0
-            f.write(json.dumps(
-                {
-                    "layer_id": self.layer_id,
-                    "rid": self.rid,
-                    "n_hits": self.n_hits,
-                    "n_miss": self.n_miss,
-                    "n_corr_pref": self.n_corr_pref,
-                    "n_pref": self.n_pref,
-                    "hit_ratio": hit_ratio
-                }
-            ))
-            f.write("\n")
-
-    def dump_activations(self):
-        with open(os.path.join(EXP_DIR, "active_experts.jsonl"), "a") as f:
-            f.write(json.dumps(
-                {
-                    "layer_id": self.layer_id,
-                    "rid": self.rid,
-                    "data": self.activations
-                }
-            ))
-            f.write("\n")
-
-    def flush(self):
-        self.dump_cache_stats()
-        self.dump_hot_stats()
-        if self.record_activations:
-            self.dump_activations()
 
 class CacheAwareTopk(torch.nn.Module):
     def __init__(self, top_k, renormalize, layer_id, fixed_num_experts) -> None:
@@ -362,11 +221,6 @@ class CacheAwareTopk(torch.nn.Module):
 
     def forward(self, hidden_states, router_logits, cached_experts=None):
         if cached_experts is None:
-            # topk_ids = torch.topk(router_logits.float(), self.topk, dim=-1).indices.contiguous()
-
-            # topk_weights = torch.gather(router_logits.float(), 1, topk_ids).softmax(dim=-1).contiguous()
-            # assert topk_weights.is_contiguous()
-
             logits = router_logits.float()                          # upcast bf16/fp16 -> fp32, as the kernel does
             probs = torch.softmax(logits, dim=-1)                   # softmax over ALL experts, fp32
 
@@ -383,40 +237,24 @@ class CacheAwareTopk(torch.nn.Module):
                 topk_ids=topk_ids,
                 router_logits=router_logits,
             )
+
         else:
             logits = router_logits.float()
             n_tokens, num_experts = logits.shape
-
-            probs = torch.softmax(logits, dim=-1)    
+            probs = torch.softmax(logits, dim=-1)
 
             topks = torch.argsort(probs, descending=True, dim=-1).to(torch.int32).contiguous()
-            
             ar = torch.arange(num_experts, device=topks.device).unsqueeze(0)
 
-            # cache_mask = torch.nn.functional.one_hot(torch.tensor(cached_experts, device=topks.device) , num_classes=num_experts).sum(dim=1).bool()
-            # cache_mask[i, e] == True iff expert e is cached/prefetched for token i  (ragged-safe)
-            lengths  = torch.tensor([len(c) for c in cached_experts], device=topks.device)
-            col_idx  = torch.tensor([e for c in cached_experts for e in c],
-                                    dtype=torch.long, device=topks.device)
-            row_idx  = torch.repeat_interleave(
-                torch.arange(n_tokens, device=topks.device), lengths)
-            cache_mask = torch.zeros(n_tokens, num_experts, dtype=torch.bool, device=topks.device)
-            cache_mask[row_idx, col_idx] = True
+            cache_mask = cached_experts[:n_tokens]  # [n_tokens, num_experts] bool, fixed-shape slice
+            cached_at_pos = torch.gather(cache_mask, 1, topks.long())  # [n_tokens, K]
 
-            # is the expert at sorted-position j cached for this token?
-            cached_at_pos = torch.gather(cache_mask, 1, topks).contiguous()              # [n_tokens, K] bool
-
-            # keep: first FIXED_EXPERTS always, plus cached ones among the rest
-            keep = (ar < self.fixed_num_experts) | cached_at_pos                    # [n_tokens, K]
-
-            # stable partition: kept positions keep their order up front, rest pushed back
+            keep = (ar < self.fixed_num_experts) | cached_at_pos
             sort_key = torch.where(keep, ar, ar + num_experts)
-            order = torch.argsort(sort_key, dim=1, stable=True)            # [n_tokens, K]
+            order = torch.argsort(sort_key, dim=1, stable=True)
+            selected = torch.gather(topks, 1, order)[:, :self.topk].contiguous()
 
-            selected = torch.gather(topks, 1, order)[:, :self.topk].contiguous()        # [n_tokens, topk]
-
-            topk_weights = torch.gather(probs, dim=1, index=selected).contiguous()
-
+            topk_weights = torch.gather(probs, dim=1, index=selected.long()).contiguous()
             if self.renormalize:
                 topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
@@ -428,11 +266,7 @@ class CacheAwareTopk(torch.nn.Module):
 
         return out
 
-
 RIDS = []
-
-
-
 
 class EarlyGate:
     def __init__(self):
@@ -453,19 +287,20 @@ class EarlyGate:
         assert layer_id not in self.gates
         self.gates[layer_id] = gate
 
-    def make_pred(self, layer_id, hidden_states, rids):
-        if not self.is_enabled: return 
+    def make_pred(self, layer_id, hidden_states, forward_batch):
+        if not self.is_enabled:
+            return
 
-        next_layer_id = layer_id+self.prefetch_offset
-        if next_layer_id in self.gates:
-            num_experts = self.gates[next_layer_id].output_size
-        
-            cached_experts = [CacheRegistry.get(rid, next_layer_id).get_experts_in_cache() for rid in rids]
-            not_cached_experts = [[e for e in range(num_experts) if e not in cached_experts[i]] for i in range(len(cached_experts))]
+        next_layer_id = layer_id + self.prefetch_offset
+        if next_layer_id not in self.gates:
+            return
 
-            next_gate = self.gates[next_layer_id]
-            router_logits, _ = next_gate(hidden_states)
-            self.preds[next_layer_id] = self.topk(hidden_states, router_logits, not_cached_experts).topk_ids
+        next_gate = self.gates[next_layer_id]
+        router_logits, _ = next_gate(hidden_states)
+        topk_ids = self.topk(hidden_states, router_logits, None).topk_ids  # [n_tokens, n_preds]
+
+        buf = forward_batch.early_gate_preds[next_layer_id]
+        buf[: topk_ids.shape[0]].copy_(topk_ids)
 
     def get_pred(self, layer_id):
         if not self.is_enabled: return None
@@ -536,8 +371,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
         else:
             raise NotImplementedError
-
-        self.cache = {}
 
         self.experts = get_moe_impl_class(quant_config)(
             layer_id=self.layer_id,
@@ -611,10 +444,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
             self.top_k = config.num_experts_per_tok
         self.is_nextn = is_nextn
-
-    def flush_cache(self, rid):
-        if rid in self.cache:
-            self.cache[rid].flush()
 
     def get_moe_weights(self):
         return [
@@ -732,40 +561,54 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         num_tokens, n_experts = router_logits.shape 
         is_decode = forward_batch.batch_size == num_tokens
-        
-        if is_decode:
-            early_gate.make_pred(self.layer_id, hidden_states, forward_batch.rids)
-            prefetch_experts = early_gate.get_pred(self.layer_id)
-            if prefetch_experts:
-                for i, rid in enumerate(forward_batch.rids): 
-                    self.cache[rid].prefetch(prefetch_experts[i])
-            
-            cached_experts = [self.cache[rid].get_experts_in_cache() for rid in forward_batch.rids]
+
+        if hasattr(forward_batch, "cached_experts"):
+            cached_experts = forward_batch.cached_experts[self.layer_id] if is_decode else None
         else:
             cached_experts = None
+
+        if is_decode:
+            early_gate.make_pred(self.layer_id, hidden_states, forward_batch)
+
+        # if is_decode:
+        #     early_gate.make_pred(self.layer_id, hidden_states, forward_batch.rids)
+        #     prefetch_experts = early_gate.get_pred(self.layer_id)
+        #     if prefetch_experts:
+        #         for i, rid in enumerate(forward_batch.rids): 
+        #             self.cache[rid].prefetch(prefetch_experts[i])
+            
+        #     cached_experts = [self.cache[rid].get_experts_in_cache() for rid in forward_batch.rids]
+        # else:
+        #     cached_experts = None
 
         if isinstance(self.topk, TopK):
             topk_output = self.topk(hidden_states, router_logits)
         else:
-            # cached_experts = [[e for e in range(256)] for _ in range(num_tokens)]
-            # cached_experts = None
-            
             topk_output = self.topk(hidden_states, router_logits, cached_experts)
         selected = topk_output.topk_ids
 
+        # forward_batch.selected_expert_ids[self.layer_id].copy_(selected)
+
+        if hasattr(forward_batch, "selected_expert_ids_prefill"):
+            forward_batch.selected_expert_ids_prefill[self.layer_id] = selected
+        else:
+            buf = forward_batch.selected_expert_ids[self.layer_id]
+            buf.zero_()
+            buf[:selected.shape[0], :].copy_(selected[:buf.shape[0], :])
+
         n_tokens = selected.shape[0]
 
-        if is_decode: assert n_tokens == len(forward_batch.rids)
+        # if is_decode: assert n_tokens == len(forward_batch.rids)
 
-        for i, rid in enumerate(forward_batch.rids):
-            if rid not in RIDS: RIDS.append(rid)
+        # for i, rid in enumerate(forward_batch.rids):
+        #     if rid not in RIDS: RIDS.append(rid)
 
-            if rid not in self.cache:
-                record_activations = False if len(RIDS) <= 1 else rid == RIDS[1]
-                self.cache[rid] = Cache(self.layer_id, rid, self.num_experts, exp_args["cache_static_cap"], exp_args["cache_dynamic_cap"], record_activations=record_activations)
-                CacheRegistry.add(self.cache[rid])
+        #     if rid not in self.cache:
+        #         record_activations = False if len(RIDS) <= 1 else rid == RIDS[1]
+        #         self.cache[rid] = Cache(self.layer_id, rid, self.num_experts, exp_args["cache_static_cap"], exp_args["cache_dynamic_cap"], record_activations=record_activations)
+        #         CacheRegistry.add(self.cache[rid])
 
-            self.cache[rid].read(selected[i].tolist(), is_decode)
+        #     self.cache[rid].read(selected[i].tolist(), is_decode)
 
         if self.enable_shared_expert_fusion and TopKOutputChecker.format_is_standard(
             topk_output
@@ -777,13 +620,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     def forward_normal_dual_stream(
         self,
         hidden_states: torch.Tensor,
+        forward_batch
     ) -> torch.Tensor:
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
         shared_output = self._forward_shared_experts(hidden_states.clone())
 
         with torch.cuda.stream(self.alt_stream):
-            router_output = self._forward_router_experts(hidden_states)
+            router_output = self._forward_router_experts(hidden_states, forward_batch)
 
         current_stream.wait_stream(self.alt_stream)
 
@@ -808,7 +652,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             and get_is_capture_mode()
         ):
             final_hidden_states, shared_output = self.forward_normal_dual_stream(
-                hidden_states
+                hidden_states,
+                forward_batch
             )
         else:
             shared_output = self._forward_shared_experts(hidden_states)
