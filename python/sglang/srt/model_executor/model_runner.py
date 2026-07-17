@@ -3449,12 +3449,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.maybe_recover_ep_ranks()
 
 
-        for layer_id in range(num_layers):
-            if is_decode:
-                sel_cpu = forward_batch.selected_expert_ids[layer_id][:forward_batch.batch_size].tolist()
+
+        if is_decode:
+            for layer_id in range(num_layers):
+                if layer_id >= exp_args["prefetch_offset"]:
+                    preds_cpu = forward_batch.early_gate_preds[layer_id][: forward_batch.batch_size].tolist()
+                    for i, rid in enumerate(forward_batch.rids):
+                        row = preds_cpu[i]
+                        if not (row and row[0] < 0):
+                            CacheRegistry.get(rid, layer_id).prefetch(row)
+                sel_cpu = forward_batch.selected_expert_ids[layer_id][: forward_batch.batch_size].tolist()
                 for i, rid in enumerate(forward_batch.rids):
                     CacheRegistry.get(rid, layer_id).read(sel_cpu[i], is_decode)
-            else:
+        else:
+            for layer_id in range(num_layers):
                 # prefill: row range [start : start + seq_len) per request
                 sel = forward_batch.selected_expert_ids_prefill[layer_id].tolist()
                 seq_lens = forward_batch.extend_seq_lens_cpu  # List[int], no GPU sync
@@ -3467,16 +3475,35 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         cache.read(row, is_decode=False)
                     start = end
 
-        if is_decode:
-            for layer_id in range(num_layers):
-                if layer_id < exp_args["prefetch_offset"]:
-                    continue
-                preds_cpu = forward_batch.early_gate_preds[layer_id][: forward_batch.batch_size].tolist()
-                for i, rid in enumerate(forward_batch.rids):
-                    row = preds_cpu[i]
-                    if row and row[0] < 0:
-                        continue  # layer has no early gate (dsv4 hash layers) — buffer never written
-                    CacheRegistry.get(rid, layer_id).prefetch(row)
+
+        # for layer_id in range(num_layers):
+        #     if is_decode:
+        #         sel_cpu = forward_batch.selected_expert_ids[layer_id][:forward_batch.batch_size].tolist()
+        #         for i, rid in enumerate(forward_batch.rids):
+        #             CacheRegistry.get(rid, layer_id).read(sel_cpu[i], is_decode)
+        #     else:
+        #         # prefill: row range [start : start + seq_len) per request
+        #         sel = forward_batch.selected_expert_ids_prefill[layer_id].tolist()
+        #         seq_lens = forward_batch.extend_seq_lens_cpu  # List[int], no GPU sync
+        #         start = 0
+        #         for rid, seq_len in zip(forward_batch.rids, seq_lens):
+        #             end = start + seq_len
+        #             token_rows = sel[start:end]                 # List[List[int]], [seq_len][top_k]
+        #             cache = CacheRegistry.get(rid, layer_id)
+        #             for row in token_rows:
+        #                 cache.read(row, is_decode=False)
+        #             start = end
+
+        # if is_decode:
+        #     for layer_id in range(num_layers):
+        #         if layer_id < exp_args["prefetch_offset"]:
+        #             continue
+        #         preds_cpu = forward_batch.early_gate_preds[layer_id][: forward_batch.batch_size].tolist()
+        #         for i, rid in enumerate(forward_batch.rids):
+        #             row = preds_cpu[i]
+        #             if row and row[0] < 0:
+        #                 continue  # layer has no early gate (dsv4 hash layers) — buffer never written
+        #             CacheRegistry.get(rid, layer_id).prefetch(row)
 
         # ForkedPdb().set_trace()
 
@@ -3892,7 +3919,12 @@ class Cache:
                 else:
                     self.evict()
                     self.dynamic_dat[e] = 0
-        
+
+        # A prefetch is only valid for the token it was issued for; clearing
+        # here keeps it out of the next token's cached_experts mask (a stale
+        # entry there would be preferentially selected but always miss)
+        self.prefetched = []
+
         return hits
     
     def get_experts_in_cache(self):

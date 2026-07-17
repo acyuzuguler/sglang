@@ -297,10 +297,22 @@ class EarlyGate:
 
         next_gate = self.gates[next_layer_id]
         router_logits, _ = next_gate(hidden_states)
-        topk_ids = self.topk(hidden_states, router_logits, None).topk_ids  # [n_tokens, n_preds]
+
+        prefetch_only_not_cache = True
+        if prefetch_only_not_cache:
+            # CacheAwareTopk prefers mask-true experts, so pass the negated
+            # mask to select the top not-cached experts instead
+            not_cached_mask = ~forward_batch.cached_experts[next_layer_id]
+        else:
+            not_cached_mask = None
+        topk_ids = self.topk(hidden_states, router_logits, not_cached_mask).topk_ids  # [n_tokens, n_preds]
 
         buf = forward_batch.early_gate_preds[next_layer_id]
         buf[: topk_ids.shape[0]].copy_(topk_ids)
+
+        # prefetched experts count as cached for this token's next-layer selection
+        mask = forward_batch.cached_experts[next_layer_id]
+        mask[: topk_ids.shape[0]].scatter_(1, topk_ids.long(), True)
 
     def get_pred(self, layer_id):
         if not self.is_enabled: return None

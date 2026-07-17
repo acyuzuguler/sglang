@@ -531,17 +531,21 @@ class EarlyGate:
 
         router_logits = self.gates[next_layer_id](hidden_states)
 
-        prefetch_only_not_cache = False
+        prefetch_only_not_cache = True
         if prefetch_only_not_cache:
-            num_experts = self.gates[next_layer_id].output_size
-            cached_experts = [CacheRegistry.get(rid, next_layer_id).get_experts_in_cache() for rid in rids]
-            not_cached_experts = [[e for e in range(num_experts) if e not in cached_experts[i]] for i in range(len(cached_experts))]
+            # CacheAwareTopk prefers mask-true experts, so pass the negated
+            # mask to select the top not-cached experts instead
+            not_cached_mask = ~forward_batch.cached_experts[next_layer_id]
         else:
-            not_cached_experts = None
+            not_cached_mask = None
 
-        topk_ids = self.topks[next_layer_id](hidden_states, router_logits, not_cached_experts).topk_ids
+        topk_ids = self.topks[next_layer_id](hidden_states, router_logits, not_cached_mask).topk_ids
         buf = forward_batch.early_gate_preds[next_layer_id]
         buf[: topk_ids.shape[0]].copy_(topk_ids)
+
+        # prefetched experts count as cached for this token's next-layer selection
+        mask = forward_batch.cached_experts[next_layer_id]
+        mask[: topk_ids.shape[0]].scatter_(1, topk_ids.long(), True)
 
 global early_gate
 early_gate = EarlyGate()
