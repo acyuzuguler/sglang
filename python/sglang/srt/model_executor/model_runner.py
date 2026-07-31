@@ -3322,6 +3322,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             mask_buffers = self.graph_runner.cached_experts_mask
             selected_expert_ids = self.graph_runner.selected_expert_ids
             early_gate_preds = self.graph_runner.early_gate_preds
+            selected_expert_scores = self.graph_runner.selected_expert_scores
+            credit_remaining = self.graph_runner.credit_remaining
+            credit_remained = self.graph_runner.credit_remained
+            credit_allocs = self.graph_runner.credit_allocs
         else:
             if not hasattr(self, "_cache_buffers"):
                 max_bsz = 256
@@ -3343,10 +3347,43 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         )
                         for layer_id in range(num_layers)
                     },
+                    # per token: k selection scores (aligned with
+                    # selected_expert_ids) + best non-selected score
+                    "selected_expert_scores": {
+                        layer_id: torch.zeros(
+                            (max_bsz, num_experts),
+                            dtype=torch.float32,
+                            device=self.device,
+                        )
+                        for layer_id in range(num_layers)
+                    },
+                    # per token: unspent cache_aware_credit budget carried
+                    # across layers within one forward pass
+                    "credit_remaining": torch.zeros(
+                        (max_bsz,), dtype=torch.int32, device=self.device
+                    ),
+                    # per (batch slot, layer): leftover credit at the end of
+                    # each layer's selection, consumed by the end-of-token
+                    # reallocation epilogue in the model
+                    "credit_remained": torch.zeros(
+                        (max_bsz, num_layers), dtype=torch.int32, device=self.device
+                    ),
+                    # per (batch slot, layer): adaptive credit allocation,
+                    # persists across decode steps (never reset per step)
+                    "credit_allocs": torch.full(
+                        (max_bsz, num_layers),
+                        exp_args["fixed_num_experts"],
+                        dtype=torch.int32,
+                        device=self.device,
+                    ),
                 }
             mask_buffers = self._cache_buffers["cached_experts_mask"]
             selected_expert_ids = self._cache_buffers["selected_expert_ids"]
             early_gate_preds = self._cache_buffers["early_gate_preds"]
+            selected_expert_scores = self._cache_buffers["selected_expert_scores"]
+            credit_remaining = self._cache_buffers["credit_remaining"]
+            credit_remained = self._cache_buffers["credit_remained"]
+            credit_allocs = self._cache_buffers["credit_allocs"]
 
         for layer_id in range(num_layers):
             buf = mask_buffers[layer_id]
@@ -3373,9 +3410,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 col_t = torch.tensor(cols, dtype=torch.long, device=self.device)
                 buf[row_t, col_t] = True  # in-place scatter into the persistent buffer
 
+        # every token starts each forward pass with an empty credit carry;
+        # this eager reset happens before graph replay, so the captured
+        # per-layer updates see a fresh buffer each step. credit_allocs is
+        # deliberately NOT reset: it is the adaptive per-layer allocation
+        # learned across decode steps.
+        credit_remaining.zero_()
+        credit_remained.zero_()
+
         forward_batch.cached_experts = mask_buffers
         forward_batch.selected_expert_ids = selected_expert_ids
         forward_batch.early_gate_preds = early_gate_preds
+        forward_batch.selected_expert_scores = selected_expert_scores
+        forward_batch.credit_remaining = credit_remaining
+        forward_batch.credit_remained = credit_remained
+        forward_batch.credit_allocs = credit_allocs
 
         if not is_decode:
             forward_batch.selected_expert_ids_prefill = {}
@@ -3451,6 +3500,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
 
         if is_decode:
+            # input token of this decode step (== token generated at the
+            # previous step); this is the token whose routing the record holds
+            tok_cpu = forward_batch.input_ids[: forward_batch.batch_size].tolist()
             for layer_id in range(num_layers):
                 if layer_id >= exp_args["prefetch_offset"]:
                     preds_cpu = forward_batch.early_gate_preds[layer_id][: forward_batch.batch_size].tolist()
@@ -3459,8 +3511,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         if not (row and row[0] < 0):
                             CacheRegistry.get(rid, layer_id).prefetch(row)
                 sel_cpu = forward_batch.selected_expert_ids[layer_id][: forward_batch.batch_size].tolist()
+                scores_cpu = forward_batch.selected_expert_scores[layer_id][: forward_batch.batch_size].tolist()
                 for i, rid in enumerate(forward_batch.rids):
-                    CacheRegistry.get(rid, layer_id).read(sel_cpu[i], is_decode)
+                    CacheRegistry.get(rid, layer_id).read(
+                        sel_cpu[i], is_decode,
+                        gate_scores=scores_cpu[i],
+                        token_id=tok_cpu[i],
+                    )
         else:
             for layer_id in range(num_layers):
                 # prefill: row range [start : start + seq_len) per request
@@ -3890,25 +3947,32 @@ class Cache:
     def prefetch(self, prefetch_experts):
         self.prefetched = prefetch_experts
 
-    def read(self, experts, is_decode):
+    def read(self, experts, is_decode, gate_scores=None, token_id=None):
         hits = [e for e in experts if e in self.static_dat or e in self.dynamic_dat or e in self.prefetched]
         misses = [e for e in experts if e not in hits]
-        
+
         if is_decode:
             for e in experts: self.hot_stats[e] += 1
-            
+
             self.n_hits += len(hits)
             self.n_miss += len(misses)
             self.n_pref += len(self.prefetched)
             self.n_corr_pref += len([e for e in self.prefetched if e in hits])
             if self.record_activations:
-                self.activations.append(
-                    {
-                        "active_experts": experts,
-                        "in_cache": list(self.static_dat.keys()) + list(self.dynamic_dat.keys()),
-                        "prefetched": self.prefetched
-                    }
-                )
+                record = {
+                    "active_experts": experts,
+                    "in_cache": list(self.static_dat.keys()) + list(self.dynamic_dat.keys()),
+                    "prefetched": self.prefetched
+                }
+                if token_id is not None:
+                    record["token_id"] = token_id
+                if gate_scores is not None:
+                    # gate_scores[i] is the router selection score of
+                    # active_experts[i]; the extra last element is the best
+                    # score among non-selected experts (runner-up), so
+                    # margin_i = gate_scores[i] - gate_score_runner_up
+                    record["gate_scores"] = [round(s, 5) for s in gate_scores]
+                self.activations.append(record)
 
         if self.dynamic_cap > 0:
             for e in experts:

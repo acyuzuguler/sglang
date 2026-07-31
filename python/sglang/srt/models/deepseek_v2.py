@@ -437,16 +437,20 @@ with open(os.path.join(EXP_DIR, "exp_args.json"), "r") as f:
     exp_args = json.load(f)
 
 class CacheAwareTopk(torch.nn.Module):
-    def __init__(self, top_k, renormalize, layer_id, fixed_num_experts, correction_bias) -> None:
+    def __init__(self, top_k, renormalize, layer_id, fixed_num_experts, correction_bias, topk_method="cache_aware") -> None:
         super().__init__()
-        assert renormalize == True, "renormalize == False is not yet supported" 
+        assert renormalize == True, "renormalize == False is not yet supported"
+        assert topk_method in ("cache_aware", "cache_aware_credit")
         self.topk = top_k
         self.renormalize = renormalize
         self.layer_id = layer_id
+        # for "cache_aware_credit", fixed_num_experts is the credit budget:
+        # the max number of non-cached experts a token may select
         self.fixed_num_experts = fixed_num_experts
         self.correction_bias = correction_bias
+        self.topk_method = topk_method
 
-    def forward(self, hidden_states, router_logits, cached_experts=None):
+    def forward(self, hidden_states, router_logits, cached_experts=None, credit_remaining=None):
         logits = router_logits.float()
         scores = torch.nn.functional.softplus(logits).sqrt()          # (1) sqrtsoftplus
         scores_for_choice = scores                                     # (2) bias only for selection
@@ -479,14 +483,33 @@ class CacheAwareTopk(torch.nn.Module):
             # is the expert at sorted-position j cached for this token?
             # cached_at_pos = torch.gather(cache_mask, 1, topks).contiguous()              # [n_tokens, K] bool
 
-            # keep: first FIXED_EXPERTS always, plus cached ones among the rest
-            keep = (ar < self.fixed_num_experts) | cached_at_pos                    # [n_tokens, K]
+            if self.topk_method == "cache_aware":
+                # keep: first FIXED_EXPERTS always, plus cached ones among the rest
+                keep = (ar < self.fixed_num_experts) | cached_at_pos                    # [n_tokens, K]
+            else:  # cache_aware_credit
+                # inclusive count of non-cached experts up to each sorted
+                # position; keep a non-cached expert only while within budget
+                credit_used = torch.cumsum((~cached_at_pos).to(torch.int32), dim=1)
+                if credit_remaining is not None:
+                    # per-token budget: this layer's allotment plus unspent
+                    # credits carried over from earlier layers of this pass
+                    budget = credit_remaining[:n_tokens] + self.fixed_num_experts  # [n_tokens]
+                    keep = cached_at_pos | (credit_used <= budget.unsqueeze(1))
+                else:
+                    keep = cached_at_pos | (credit_used <= self.fixed_num_experts)
 
             # stable partition: kept positions keep their order up front, rest pushed back
             sort_key = torch.where(keep, ar, ar + num_experts)
             order = torch.argsort(sort_key, dim=1, stable=True)            # [n_tokens, K]
 
             selected = torch.gather(topks, 1, order)[:, :self.topk].contiguous()
+
+            if self.topk_method == "cache_aware_credit" and credit_remaining is not None:
+                # non-cached selections consume credit; clamp covers the
+                # underfull case where padded slots exceed the budget
+                cached_sel = torch.gather(cached_at_pos, 1, order)[:, :self.topk]
+                spent = (~cached_sel).sum(dim=1, dtype=torch.int32)
+                credit_remaining[:n_tokens].copy_((budget - spent).clamp(min=0))
             topk_weights = torch.gather(scores, dim=1, index=selected.long()).contiguous()  # scores, not probs
             if self.renormalize:
                 topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
@@ -704,13 +727,14 @@ class DeepseekV2MoE(nn.Module):
                         is_fp4_experts=getattr(quant_config, "is_fp4_experts", False),
                     )
                 self.topk = TopK(**topk_kwargs)
-            elif exp_args["topk_method"] == "cache_aware":
+            elif exp_args["topk_method"] in ("cache_aware", "cache_aware_credit"):
                 self.topk = CacheAwareTopk(
                     top_k=config.num_experts_per_tok,
                     renormalize=config.norm_topk_prob,
                     layer_id=layer_id,
                     fixed_num_experts=exp_args["fixed_num_experts"],
-                    correction_bias=self.gate.e_score_correction_bias  
+                    correction_bias=self.gate.e_score_correction_bias,
+                    topk_method=exp_args["topk_method"],
                 )
             else:
                 raise NotImplementedError
@@ -886,6 +910,24 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states, forward_batch, input_ids_global=input_ids_global
             )
 
+    def _capture_gate_scores(self, forward_batch, topk_output, router_logits):
+        """Record per-token router selection scores for the chosen experts plus
+        the best non-selected score (runner-up) into the persistent buffer, for
+        offline cache analysis. Layout per row: [score(topk_0..topk_k-1), runner_up].
+        Scores mirror CacheAwareTopk's selection metric: sqrt(softplus(logit))
+        plus e_score_correction_bias. Graph-safe: fixed shapes, in-place buffer
+        writes only."""
+        if not hasattr(forward_batch, "selected_expert_scores"):
+            return
+        sbuf = forward_batch.selected_expert_scores[self.layer_id]
+        scores = torch.nn.functional.softplus(router_logits.float()).sqrt()
+        bias = getattr(self.gate, "e_score_correction_bias", None)
+        if bias is not None:
+            scores = scores + bias.float().unsqueeze(0)
+        sbuf.zero_()
+        n = min(scores.shape[0], sbuf.shape[0])
+        sbuf[:n, :].copy_(scores[:n])
+
     def forward_normal_dual_stream(
         self,
         hidden_states: torch.Tensor,
@@ -937,7 +979,8 @@ class DeepseekV2MoE(nn.Module):
                     **topk_kwargs,
                 )
             else:
-                topk_output = self.topk(hidden_states, router_logits, cached_experts)
+                credit_remaining = getattr(forward_batch, "credit_remaining", None) if is_decode else None
+                topk_output = self.topk(hidden_states, router_logits, cached_experts, credit_remaining)
 
             if hasattr(forward_batch, "selected_expert_ids_prefill"):
                 forward_batch.selected_expert_ids_prefill[self.layer_id] = topk_output.topk_ids
@@ -945,6 +988,7 @@ class DeepseekV2MoE(nn.Module):
                 buf = forward_batch.selected_expert_ids[self.layer_id]
                 buf.zero_()
                 buf[: topk_output.topk_ids.shape[0], :].copy_(topk_output.topk_ids[: buf.shape[0], :])
+                self._capture_gate_scores(forward_batch, topk_output, router_logits)
 
             final_hidden_states = self.experts(hidden_states, topk_output)
             if not (_is_cuda or _is_musa) or isinstance(
@@ -1027,7 +1071,8 @@ class DeepseekV2MoE(nn.Module):
                     **topk_kwargs,
                 )
             else:
-                topk_output = self.topk(hidden_states, router_logits, cached_experts)
+                credit_remaining = getattr(forward_batch, "credit_remaining", None) if is_decode else None
+                topk_output = self.topk(hidden_states, router_logits, cached_experts, credit_remaining)
 
             if hasattr(forward_batch, "selected_expert_ids_prefill"):
                 forward_batch.selected_expert_ids_prefill[self.layer_id] = topk_output.topk_ids
@@ -1035,6 +1080,7 @@ class DeepseekV2MoE(nn.Module):
                 buf = forward_batch.selected_expert_ids[self.layer_id]
                 buf.zero_()
                 buf[: topk_output.topk_ids.shape[0], :].copy_(topk_output.topk_ids[: buf.shape[0], :])
+                self._capture_gate_scores(forward_batch, topk_output, router_logits)
 
         else:
             shared_output = None

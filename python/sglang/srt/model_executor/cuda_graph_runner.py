@@ -766,6 +766,37 @@ class CudaGraphRunner:
             for layer_id in range(num_layers)
         }
 
+        # per token: k selection scores (aligned with selected_expert_ids)
+        # + best non-selected score
+        self.selected_expert_scores = {
+            layer_id: torch.zeros(
+                (max_bsz, num_experts),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            for layer_id in range(num_layers)
+        }
+
+        # per token: unspent cache_aware_credit budget carried across layers
+        # within one forward pass (single buffer, updated in place per layer)
+        self.credit_remaining = torch.zeros(
+            (max_bsz,), dtype=torch.int32, device=self.device
+        )
+
+        # per (batch slot, layer): leftover credit at the end of each layer's
+        # selection, consumed by the end-of-token reallocation epilogue
+        self.credit_remained = torch.zeros(
+            (max_bsz, num_layers), dtype=torch.int32, device=self.device
+        )
+        # per (batch slot, layer): adaptive credit allocation, persists across
+        # decode steps (updated in place inside the captured graph)
+        self.credit_allocs = torch.full(
+            (max_bsz, num_layers),
+            exp_args["fixed_num_experts"],
+            dtype=torch.int32,
+            device=self.device,
+        )
+
         # Capture
         try:
             with model_capture_mode():
@@ -774,6 +805,16 @@ class CudaGraphRunner:
             raise Exception(
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
+
+        # capture warmup replays ran the reallocation epilogue on dummy data;
+        # restore the initial uniform allocation before serving
+        self.credit_allocs.fill_(exp_args["fixed_num_experts"])
+        # likewise reset the cache_prior running-mean of the logit range
+        # (accumulated on dummy capture activations)
+        for m in model_runner.model.modules():
+            if hasattr(m, "prior_delta_sum"):
+                m.prior_delta_sum.zero_()
+                m.prior_delta_ct.zero_()
 
     def maybe_init_pdmux(self):
         if self.enable_pdmux:
@@ -1151,6 +1192,10 @@ class CudaGraphRunner:
         forward_batch.selected_expert_ids = self.selected_expert_ids
         forward_batch.cached_experts = self.cached_experts_mask
         forward_batch.early_gate_preds = self.early_gate_preds
+        forward_batch.selected_expert_scores = self.selected_expert_scores
+        forward_batch.credit_remaining = self.credit_remaining
+        forward_batch.credit_remained = self.credit_remained
+        forward_batch.credit_allocs = self.credit_allocs
         
         # HiSparse: set coordinator so the hisparse code path is captured into the graph
         forward_batch.hisparse_coordinator = self.model_runner.hisparse_coordinator

@@ -211,15 +211,29 @@ with open(os.path.join(EXP_DIR, "exp_args.json"), "r") as f:
     exp_args = json.load(f)
 
 class CacheAwareTopk(torch.nn.Module):
-    def __init__(self, top_k, renormalize, layer_id, fixed_num_experts) -> None:
+    def __init__(self, top_k, renormalize, layer_id, fixed_num_experts, topk_method="cache_aware",
+                 cum_threshold=0.1, prior_lam=0.2) -> None:
         super().__init__()
-        assert renormalize == True, "renormalize == False is not yet supported" 
+        assert renormalize == True, "renormalize == False is not yet supported"
+        assert topk_method in ("cache_aware", "cache_aware_credit", "cumsum", "cache_prior")
         self.topk = top_k
         self.renormalize = renormalize
         self.layer_id = layer_id
+        # for "cache_aware_credit", fixed_num_experts is the credit budget:
+        # the max number of non-cached experts a token may select; for the
+        # arXiv:2412.00099 baselines (cumsum/cache_prior) it is J, the number
+        # of top-ranked experts whose selection is always guaranteed
         self.fixed_num_experts = fixed_num_experts
+        self.topk_method = topk_method
+        self.cum_threshold = cum_threshold  # cumsum: prob mass defining the window
+        self.prior_lam = prior_lam          # cache_prior: boost = lam * delta_avg
+        # cache_prior delta_avg (eq. 10): running mean over decode steps of the
+        # per-token router logit range. Plain buffers (not in state_dict);
+        # in-place updates keep this CUDA-graph capturable.
+        self.register_buffer("prior_delta_sum", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("prior_delta_ct", torch.zeros((), dtype=torch.float32), persistent=False)
 
-    def forward(self, hidden_states, router_logits, cached_experts=None):
+    def forward(self, hidden_states, router_logits, cached_experts=None, credit_remaining=None, credit_alloc=None):
         if cached_experts is None:
             logits = router_logits.float()                          # upcast bf16/fp16 -> fp32, as the kernel does
             probs = torch.softmax(logits, dim=-1)                   # softmax over ALL experts, fp32
@@ -243,16 +257,80 @@ class CacheAwareTopk(torch.nn.Module):
             n_tokens, num_experts = logits.shape
             probs = torch.softmax(logits, dim=-1)
 
+            cache_mask = cached_experts[:n_tokens]  # [n_tokens, num_experts] bool, fixed-shape slice
+
+            if self.topk_method == "cache_prior":
+                # arXiv:2412.00099 eq. 9-10: rank by z' = z + lam*delta_avg for
+                # cached (and guaranteed top-J) experts; delta_avg is a running
+                # mean of the per-token logit range, accumulated online.
+                delta = (logits.max(dim=-1).values - logits.min(dim=-1).values).mean()
+                self.prior_delta_sum.add_(delta)
+                self.prior_delta_ct.add_(1.0)
+                delta_avg = self.prior_delta_sum / self.prior_delta_ct.clamp(min=1.0)
+                # clone: never scatter into the shared cached_experts buffer
+                boost_mask = cache_mask.clone()
+                if self.fixed_num_experts > 0:
+                    topj = torch.topk(logits, self.fixed_num_experts, dim=-1).indices
+                    boost_mask.scatter_(1, topj, True)
+                zprime = logits + self.prior_lam * delta_avg * boost_mask.to(logits.dtype)
+                selected = torch.argsort(zprime, descending=True, dim=-1, stable=True)[
+                    :, : self.topk
+                ].to(torch.int32).contiguous()
+
+                topk_weights = torch.gather(probs, dim=1, index=selected.long()).contiguous()
+                if self.renormalize:
+                    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+                return StandardTopKOutput(
+                    topk_weights=topk_weights,
+                    topk_ids=selected,
+                    router_logits=router_logits,
+                )
+
             topks = torch.argsort(probs, descending=True, dim=-1).to(torch.int32).contiguous()
             ar = torch.arange(num_experts, device=topks.device).unsqueeze(0)
 
-            cache_mask = cached_experts[:n_tokens]  # [n_tokens, num_experts] bool, fixed-shape slice
             cached_at_pos = torch.gather(cache_mask, 1, topks.long())  # [n_tokens, K]
 
-            keep = (ar < self.fixed_num_experts) | cached_at_pos
+            if self.topk_method == "cache_aware":
+                keep = (ar < self.fixed_num_experts) | cached_at_pos
+            elif self.topk_method == "cumsum":
+                # arXiv:2412.00099 eq. 8: max-rank with a dynamic window = the
+                # smallest M whose top-M routing probs sum to cum_threshold; a
+                # position is inside the window iff the prob mass strictly
+                # before it is below the threshold (inclusive of the crossing
+                # element, matching check_cache.py)
+                sorted_probs = torch.gather(probs, 1, topks.long())
+                csum = torch.cumsum(sorted_probs, dim=1)
+                total = csum[:, -1:]
+                in_window = (csum - sorted_probs) < self.cum_threshold * total
+                keep = (ar < self.fixed_num_experts) | (cached_at_pos & in_window)
+            else:  # cache_aware_credit
+                # inclusive count of non-cached experts up to each sorted
+                # position; keep a non-cached expert only while within budget
+                credit_used = torch.cumsum((~cached_at_pos).to(torch.int32), dim=1)
+                if credit_remaining is not None:
+                    # per-token budget: this layer's allotment plus unspent
+                    # credits carried over from earlier layers of this pass.
+                    # credit_alloc is the adaptive per-layer grant (learned
+                    # across tokens); without it the grant is the static one.
+                    if credit_alloc is not None:
+                        grant = credit_alloc[:n_tokens]  # [n_tokens] int32
+                    else:
+                        grant = self.fixed_num_experts
+                    budget = credit_remaining[:n_tokens] + grant  # [n_tokens]
+                    keep = cached_at_pos | (credit_used <= budget.unsqueeze(1))
+                else:
+                    keep = cached_at_pos | (credit_used <= self.fixed_num_experts)
             sort_key = torch.where(keep, ar, ar + num_experts)
             order = torch.argsort(sort_key, dim=1, stable=True)
             selected = torch.gather(topks, 1, order)[:, :self.topk].contiguous()
+
+            if self.topk_method == "cache_aware_credit" and credit_remaining is not None:
+                # non-cached selections consume credit; clamp covers the
+                # underfull case where padded slots exceed the budget
+                cached_sel = torch.gather(cached_at_pos, 1, order)[:, :self.topk]
+                spent = (~cached_sel).sum(dim=1, dtype=torch.int32)
+                credit_remaining[:n_tokens].copy_((budget - spent).clamp(min=0))
 
             topk_weights = torch.gather(probs, dim=1, index=selected.long()).contiguous()
             if self.renormalize:
@@ -374,12 +452,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 renormalize=config.norm_topk_prob,
                 layer_id=layer_id,
             )
-        elif exp_args["topk_method"] == "cache_aware":
+        elif exp_args["topk_method"] in ("cache_aware", "cache_aware_credit", "cumsum", "cache_prior"):
             self.topk = CacheAwareTopk(
                 top_k=config.num_experts_per_tok,
                 renormalize=config.norm_topk_prob,
                 layer_id=layer_id,
-                fixed_num_experts=exp_args["fixed_num_experts"]     
+                fixed_num_experts=exp_args["fixed_num_experts"],
+                topk_method=exp_args["topk_method"],
+                cum_threshold=exp_args.get("cum_threshold", 0.1),
+                prior_lam=exp_args.get("prior_lam", 0.2),
             )
         else:
             raise NotImplementedError
@@ -596,7 +677,20 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if isinstance(self.topk, TopK):
             topk_output = self.topk(hidden_states, router_logits)
         else:
-            topk_output = self.topk(hidden_states, router_logits, cached_experts)
+            credit_remaining = getattr(forward_batch, "credit_remaining", None) if is_decode else None
+            credit_allocs = getattr(forward_batch, "credit_allocs", None) if is_decode else None
+            credit_alloc = credit_allocs[:, self.layer_id] if credit_allocs is not None else None
+            topk_output = self.topk(hidden_states, router_logits, cached_experts, credit_remaining, credit_alloc)
+            if (
+                credit_remaining is not None
+                and getattr(self.topk, "topk_method", None) == "cache_aware_credit"
+                and hasattr(forward_batch, "credit_remained")
+            ):
+                # record this layer's end-of-pass leftover; the model-level
+                # epilogue redistributes allocations from it after the last layer
+                forward_batch.credit_remained[:num_tokens, self.layer_id].copy_(
+                    credit_remaining[:num_tokens]
+                )
         selected = topk_output.topk_ids
 
         # forward_batch.selected_expert_ids[self.layer_id].copy_(selected)
@@ -607,6 +701,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             buf = forward_batch.selected_expert_ids[self.layer_id]
             buf.zero_()
             buf[:selected.shape[0], :].copy_(selected[:buf.shape[0], :])
+            # record router selection scores (softmax probs, mirroring
+            # CacheAwareTopk) + best non-selected score for cache analysis
+            if hasattr(forward_batch, "selected_expert_scores"):
+                sbuf = forward_batch.selected_expert_scores[self.layer_id]
+                probs = torch.softmax(router_logits.float(), dim=-1)
+                sbuf.zero_()
+                n = min(probs.shape[0], sbuf.shape[0])
+                sbuf[:n, :].copy_(probs[:n])
 
         n_tokens = selected.shape[0]
 
@@ -961,6 +1063,37 @@ class Qwen2MoeModel(nn.Module):
         for layer_id in self.layers_to_capture:
             setattr(self.layers[layer_id], "_is_layer_to_capture", True)
 
+    def _update_credit_allocs(self, forward_batch: ForwardBatch):
+        """End-of-token credit reallocation for cache_aware_credit, mirroring
+        eval/check_cache.py: a layer that ended the pass with leftover credit
+        donates one credit from its future allocation, and the freed credits
+        go to the layers that ended with the least leftover (the starved
+        ones). Total allocation per token stays fixed_num_experts*num_layers.
+
+        Allocations are slot-indexed per batch row: row i learns for whatever
+        request occupies decode slot i (exact per-request semantics at bsz=1).
+        Fixed-shape tensor ops only, so this is CUDA-graph capturable."""
+        allocs_buf = getattr(forward_batch, "credit_allocs", None)
+        remained_buf = getattr(forward_batch, "credit_remained", None)
+        if (
+            allocs_buf is None
+            or remained_buf is None
+            or not forward_batch.forward_mode.is_decode()
+        ):
+            return
+        # basic slicing -> views into the persistent buffers (this PP rank's layers)
+        allocs = allocs_buf[:, self.start_layer : self.end_layer]
+        rem = remained_buf[:, self.start_layer : self.end_layer]
+
+        freed = (rem > 0) & (allocs > 0)
+        n_freed = freed.sum(dim=1, keepdim=True, dtype=torch.int32)
+        # rank layers by leftover ascending; stable sort keeps the earlier
+        # layer on ties, matching the python sort in check_cache.py
+        order = torch.argsort(rem, dim=1, stable=True)
+        ranks = torch.argsort(order, dim=1, stable=True)
+        allocs.sub_(freed.to(allocs.dtype))
+        allocs.add_((ranks < n_freed).to(allocs.dtype))
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -1020,6 +1153,9 @@ class Qwen2MoeModel(nn.Module):
                             else None
                         ),
                     )
+
+        if exp_args["topk_method"] == "cache_aware_credit":
+            self._update_credit_allocs(forward_batch)
 
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
