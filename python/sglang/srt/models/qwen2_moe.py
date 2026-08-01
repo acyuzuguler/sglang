@@ -114,6 +114,8 @@ from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_stream
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
+from sglang.srt.state_capturer.gate_scores import get_global_gate_scores_capturer
+
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
 logger = logging.getLogger(__name__)
@@ -488,6 +490,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     def _forward_router_experts(self, hidden_states: torch.Tensor):
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
+
+        if (cap := get_global_gate_scores_capturer()) is not None:
+            cap.capture(
+                self.layer_id,
+                torch.softmax(router_logits.float(), dim=-1).to(torch.float16),
+            )
+
         topk_output = self.topk(hidden_states, router_logits)
         if self.enable_shared_expert_fusion and TopKOutputChecker.format_is_standard(
             topk_output

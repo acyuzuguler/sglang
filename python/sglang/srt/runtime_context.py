@@ -400,6 +400,7 @@ class Resources(_FlagGroupBase):
     # State capturers (installed by their subsystems when capture is on).
     indexer_capturer: Any = None
     experts_capturer: Any = None
+    gate_scores_capturer: Any = None
     # The shared TCPStore created during distributed initialization.
     tcp_store: Any = None
     # Trace verbosity; the accessor seeds it lazily from SGLANG_TRACE_LEVEL.

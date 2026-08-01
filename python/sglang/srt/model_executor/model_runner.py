@@ -183,6 +183,11 @@ from sglang.srt.state_capturer.routed_experts import (
     get_global_experts_capturer,
     set_global_experts_capturer,
 )
+from sglang.srt.state_capturer.gate_scores import (
+    GateScoresCapturer,
+    get_global_gate_scores_capturer,
+    set_global_gate_scores_capturer,
+)
 from sglang.srt.utils import (
     cpu_has_amx_support,
     enable_show_time_cost,
@@ -764,8 +769,9 @@ class ModelRunner:
         self.init_ngram_embedding_manager()
 
         self.maybe_init_hisparse_coordinator()
-
+        self.init_gate_scores_capturer()
         self.init_routed_experts_capturer()
+
         self.init_indexer_capturer()
 
         self.graph_shared_output = None
@@ -854,6 +860,18 @@ class ModelRunner:
         set_global_experts_capturer(
             RoutedExpertsCapturer.create(
                 model=self.model,
+                model_config=self.model_config,
+                num_tokens=self.max_total_num_tokens + self.page_size,
+                max_running_requests=self.max_running_requests,
+                device=self.device,
+            )
+        )
+
+    def init_gate_scores_capturer(self):
+        if self.is_draft_worker:
+            return
+        set_global_gate_scores_capturer(
+            GateScoresCapturer.create(
                 model_config=self.model_config,
                 num_tokens=self.max_total_num_tokens + self.page_size,
                 max_running_requests=self.max_running_requests,
@@ -1300,6 +1318,17 @@ class ModelRunner:
                 can_run_graph=output.can_run_graph,
                 cuda_graph_batch=getattr(self.decode_cuda_graph_runner, "bs", None),
                 no_copy_to_cpu=no_copy_to_cpu,
+            )
+
+        if (
+            not self.is_draft_worker
+            and (gate_scores_capturer := get_global_gate_scores_capturer()) is not None
+        ):
+            gate_scores_capturer.on_forward_end(
+                forward_batch=forward_batch,
+                can_run_graph=output.can_run_graph,
+                cuda_graph_batch=getattr(self.decode_cuda_graph_runner, "bs", None),
+                no_copy_to_cpu=False,  # factory asserts --disable-overlap-schedule
             )
 
         if (indexer_capturer := get_global_indexer_capturer()) is not None:

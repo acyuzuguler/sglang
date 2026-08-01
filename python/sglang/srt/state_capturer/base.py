@@ -25,10 +25,11 @@ class BaseDeviceCache:
         topk_size: int,
         device: str,
         name: str,
+        dtype: torch.dtype = torch.int32
     ):
         self.buffer = torch.zeros(
             (max_batch_size, num_layers, topk_size),
-            dtype=torch.int32,
+            dtype=dtype,
             device=device,
         )
         self.num_layers = num_layers
@@ -52,10 +53,10 @@ class BaseDeviceCache:
 
 
 class BaseHostCache:
-    def __init__(self, num_tokens: int, num_layers: int, topk_size: int, name: str):
+    def __init__(self, num_tokens: int, num_layers: int, topk_size: int, name: str, dtype: torch.dtype = torch.int32):
         self.buffer = torch.zeros(
             (num_tokens, num_layers, topk_size),
-            dtype=torch.int32,
+            dtype=dtype,
             device="cpu",
             pin_memory=True,
         )
@@ -107,6 +108,7 @@ class BaseTopkCapturer:
         device: str,
         name: str,
         device_topk_size: Optional[int] = None,
+        dtype: torch.dtype = torch.int32
     ):
         """device_topk_size defaults to topk_size; pass a different value when
         the device buffer needs extra columns (e.g. fused shared experts) that
@@ -115,13 +117,14 @@ class BaseTopkCapturer:
         self.num_layers = num_layers
         self.topk_size = topk_size
 
-        self.host_cache = BaseHostCache(num_tokens, num_layers, topk_size, name=name)
+        self.host_cache = BaseHostCache(num_tokens, num_layers, topk_size, name=name, dtype=dtype)
         self.device_cache = BaseDeviceCache(
             max_batch_size,
             num_layers,
             device_topk_size if device_topk_size is not None else topk_size,
             device,
             name=name,
+            dtype=dtype
         )
 
     def capture(self, layer_id: int, topk_indices: torch.Tensor):

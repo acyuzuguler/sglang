@@ -30,6 +30,7 @@ from sglang.srt.runtime_context import get_server_args
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
+from sglang.srt.state_capturer.gate_scores import get_global_gate_scores_capturer
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -145,6 +146,23 @@ class SchedulerBatchResultProcessor:
                 req.routed_experts_start_len,
             )
 
+    def _maybe_dump_gate_scores(self, req: Req):
+        capturer = get_global_gate_scores_capturer()
+        if capturer is None:
+            return
+        seqlen = len(req.origin_input_ids) + len(req.output_ids_through_stop)
+        scores = capturer.get_topk(
+            req_pool_idx=req.req_pool_idx,
+            seqlen=seqlen,
+            req_to_token_pool=self.req_to_token_pool,
+        )  # [seqlen-1, num_layers, num_experts] fp16
+        capturer.dump(
+            rid=req.rid,
+            scores=scores,
+            input_len=len(req.origin_input_ids),
+            output_len=len(req.output_ids_through_stop),
+        )
+
     def _maybe_collect_indexer_topk(self, req: Req):
         capturer = get_global_indexer_capturer()
         if capturer is None:
@@ -237,6 +255,7 @@ class SchedulerBatchResultProcessor:
                     req.update_finish_state()
                     if req.finished():
                         self._maybe_collect_routed_experts(req)
+                        self._maybe_dump_gate_scores(req)
                         self._maybe_collect_indexer_topk(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
@@ -884,6 +903,7 @@ class SchedulerBatchResultProcessor:
             if req.multimodal_inputs is not None and req.session is None:
                 req.multimodal_inputs.release_features()
             self._maybe_collect_routed_experts(req)
+            self._maybe_dump_gate_scores(req)
             self._maybe_collect_indexer_topk(req)
 
             if self.server_args.disaggregation_decode_enable_offload_kvcache:

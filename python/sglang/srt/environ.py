@@ -662,7 +662,8 @@ class Envs:
     SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE = EnvIntWithAlias(
         32, deprecated_name="SGLANG_EPLB_ROCM_P2P_BATCH_CHUNK_SIZE"
     )
-
+    SGLANG_LOG_GATE_SCORES_DIR = EnvStr(None)
+    
     # TBO
     SGLANG_TBO_DEBUG = EnvBool(False)
 
