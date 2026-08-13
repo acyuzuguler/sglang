@@ -183,6 +183,26 @@ from sglang.srt.state_capturer.routed_experts import (
     get_global_experts_capturer,
     set_global_experts_capturer,
 )
+from sglang.srt.layers.moe.credit_router import (
+    CreditRouter,
+    get_global_credit_router,
+    set_global_credit_router,
+)
+from sglang.srt.state_capturer.credit import (
+    CreditCapturer,
+    get_global_credit_capturer,
+    set_global_credit_capturer,
+)
+from sglang.srt.layers.moe.blaze_router import (
+    BlazeRouter,
+    get_global_blaze_router,
+    set_global_blaze_router,
+)
+from sglang.srt.state_capturer.blaze import (
+    BlazeCapturer,
+    get_global_blaze_capturer,
+    set_global_blaze_capturer,
+)
 from sglang.srt.state_capturer.gate_scores import (
     GateScoresCapturer,
     get_global_gate_scores_capturer,
@@ -770,6 +790,10 @@ class ModelRunner:
 
         self.maybe_init_hisparse_coordinator()
         self.init_gate_scores_capturer()
+        self.init_credit_router()
+        self.init_credit_capturer()
+        self.init_blaze_router()
+        self.init_blaze_capturer()
         self.init_routed_experts_capturer()
 
         self.init_indexer_capturer()
@@ -872,6 +896,52 @@ class ModelRunner:
             return
         set_global_gate_scores_capturer(
             GateScoresCapturer.create(
+                model_config=self.model_config,
+                num_tokens=self.max_total_num_tokens + self.page_size,
+                max_running_requests=self.max_running_requests,
+                device=self.device,
+            )
+        )
+
+    def init_credit_router(self):
+        if self.is_draft_worker:
+            return
+        set_global_credit_router(
+            CreditRouter.create(
+                model_config=self.model_config,
+                max_running_requests=self.max_running_requests,
+                device=self.device,
+            )
+        )
+
+    def init_credit_capturer(self):
+        if self.is_draft_worker:
+            return
+        set_global_credit_capturer(
+            CreditCapturer.create(
+                model_config=self.model_config,
+                num_tokens=self.max_total_num_tokens + self.page_size,
+                max_running_requests=self.max_running_requests,
+                device=self.device,
+            )
+        )
+
+    def init_blaze_router(self):
+        if self.is_draft_worker:
+            return
+        set_global_blaze_router(
+            BlazeRouter.create(
+                model_config=self.model_config,
+                max_running_requests=self.max_running_requests,
+                device=self.device,
+            )
+        )
+
+    def init_blaze_capturer(self):
+        if self.is_draft_worker:
+            return
+        set_global_blaze_capturer(
+            BlazeCapturer.create(
                 model_config=self.model_config,
                 num_tokens=self.max_total_num_tokens + self.page_size,
                 max_running_requests=self.max_running_requests,
@@ -1325,6 +1395,36 @@ class ModelRunner:
             and (gate_scores_capturer := get_global_gate_scores_capturer()) is not None
         ):
             gate_scores_capturer.on_forward_end(
+                forward_batch=forward_batch,
+                can_run_graph=output.can_run_graph,
+                cuda_graph_batch=getattr(self.decode_cuda_graph_runner, "bs", None),
+                no_copy_to_cpu=False,  # factory asserts --disable-overlap-schedule
+            )
+
+        if (credit_router := get_global_credit_router()) is not None:
+            credit_router.debug_flush()
+
+        if (
+            not self.is_draft_worker
+            and forward_batch.forward_mode.is_decode()  # credit buffer is decode-only
+            and (credit_capturer := get_global_credit_capturer()) is not None
+        ):
+            credit_capturer.on_forward_end(
+                forward_batch=forward_batch,
+                can_run_graph=output.can_run_graph,
+                cuda_graph_batch=getattr(self.decode_cuda_graph_runner, "bs", None),
+                no_copy_to_cpu=False,  # factory asserts --disable-overlap-schedule
+            )
+
+        if (blaze_router := get_global_blaze_router()) is not None:
+            blaze_router.on_forward_end(forward_batch=forward_batch)
+
+        if (
+            not self.is_draft_worker
+            and forward_batch.forward_mode.is_decode()  # blaze buffer is decode-only
+            and (blaze_capturer := get_global_blaze_capturer()) is not None
+        ):
+            blaze_capturer.on_forward_end(
                 forward_batch=forward_batch,
                 can_run_graph=output.can_run_graph,
                 cuda_graph_batch=getattr(self.decode_cuda_graph_runner, "bs", None),

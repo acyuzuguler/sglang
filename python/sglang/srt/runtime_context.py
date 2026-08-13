@@ -401,6 +401,14 @@ class Resources(_FlagGroupBase):
     indexer_capturer: Any = None
     experts_capturer: Any = None
     gate_scores_capturer: Any = None
+    # Per-request credit-based MoE router (installed when SGLANG_CREDIT_ROUTER is on).
+    credit_router: Any = None
+    # Per-request post-credit routing capturer (installed when SGLANG_LOG_CREDIT_DIR set).
+    credit_capturer: Any = None
+    # BLAZE static-load-penalty MoE router (installed when SGLANG_BLAZE_ROUTER is on).
+    blaze_router: Any = None
+    # Per-request post-blaze routing capturer (installed when SGLANG_LOG_BLAZE_DIR set).
+    blaze_capturer: Any = None
     # The shared TCPStore created during distributed initialization.
     tcp_store: Any = None
     # Trace verbosity; the accessor seeds it lazily from SGLANG_TRACE_LEVEL.

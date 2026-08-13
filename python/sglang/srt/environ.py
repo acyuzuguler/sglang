@@ -663,7 +663,31 @@ class Envs:
         32, deprecated_name="SGLANG_EPLB_ROCM_P2P_BATCH_CHUNK_SIZE"
     )
     SGLANG_LOG_GATE_SCORES_DIR = EnvStr(None)
-    
+
+    # Credit-based MoE routing (per-request load balancing; qwen3.5-moe only)
+    SGLANG_CREDIT_ROUTER = EnvBool(False)
+    SGLANG_CREDIT_MAX_CRED = EnvInt(240)
+    SGLANG_CREDIT_COST = EnvInt(8)
+    SGLANG_CREDIT_DEBUG = EnvBool(False)
+    # Per-request dump of post-credit expert ids + selected-expert credits (qwen3.5-moe).
+    SGLANG_LOG_CREDIT_DIR = EnvStr(None)
+
+    # BLAZE MoE routing (static load-penalized top-k, MLSys'26; qwen3.5-moe only)
+    SGLANG_BLAZE_ROUTER = EnvBool(False)
+    SGLANG_BLAZE_ALPHA = EnvFloat(0.5)
+    SGLANG_BLAZE_TAU = EnvFloat(1.5)
+    # Safety-monitor alpha policy: fixed | reset_safe | fixed_clamped | monotonic
+    # ("fixed" disables the monitor and keeps alpha = SGLANG_BLAZE_ALPHA).
+    SGLANG_BLAZE_ALPHA_POLICY = EnvStr("fixed")
+    # .pt file with per-layer per-expert load counts [num_layers, num_experts]
+    # (raw tensor or {"loads": tensor}); produced by eval/sim_batched.py.
+    # Unset -> uniform profile, which makes blaze routing exactly vanilla
+    # (smoke-test mode, no balancing).
+    SGLANG_BLAZE_LOAD_FILE = EnvStr(None)
+    SGLANG_BLAZE_DEBUG = EnvBool(False)
+    # Per-request dump of post-blaze expert ids (qwen3.5-moe).
+    SGLANG_LOG_BLAZE_DIR = EnvStr(None)
+
     # TBO
     SGLANG_TBO_DEBUG = EnvBool(False)
 

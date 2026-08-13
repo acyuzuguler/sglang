@@ -31,6 +31,8 @@ from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.state_capturer.gate_scores import get_global_gate_scores_capturer
+from sglang.srt.state_capturer.credit import get_global_credit_capturer
+from sglang.srt.state_capturer.blaze import get_global_blaze_capturer
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -163,6 +165,40 @@ class SchedulerBatchResultProcessor:
             output_len=len(req.output_ids_through_stop),
         )
 
+    def _maybe_dump_credit(self, req: Req):
+        capturer = get_global_credit_capturer()
+        if capturer is None:
+            return
+        seqlen = len(req.origin_input_ids) + len(req.output_ids_through_stop)
+        record = capturer.get_topk(
+            req_pool_idx=req.req_pool_idx,
+            seqlen=seqlen,
+            req_to_token_pool=self.req_to_token_pool,
+        )  # [seqlen-1, num_layers, 2*k] int16; decode rows carry post-credit ids+creds
+        capturer.dump(
+            rid=req.rid,
+            record=record,
+            input_len=len(req.origin_input_ids),
+            output_len=len(req.output_ids_through_stop),
+        )
+
+    def _maybe_dump_blaze(self, req: Req):
+        capturer = get_global_blaze_capturer()
+        if capturer is None:
+            return
+        seqlen = len(req.origin_input_ids) + len(req.output_ids_through_stop)
+        record = capturer.get_topk(
+            req_pool_idx=req.req_pool_idx,
+            seqlen=seqlen,
+            req_to_token_pool=self.req_to_token_pool,
+        )  # [seqlen-1, num_layers, k] int16; decode rows carry post-blaze ids
+        capturer.dump(
+            rid=req.rid,
+            record=record,
+            input_len=len(req.origin_input_ids),
+            output_len=len(req.output_ids_through_stop),
+        )
+
     def _maybe_collect_indexer_topk(self, req: Req):
         capturer = get_global_indexer_capturer()
         if capturer is None:
@@ -256,6 +292,8 @@ class SchedulerBatchResultProcessor:
                     if req.finished():
                         self._maybe_collect_routed_experts(req)
                         self._maybe_dump_gate_scores(req)
+                        self._maybe_dump_credit(req)
+                        self._maybe_dump_blaze(req)
                         self._maybe_collect_indexer_topk(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
@@ -904,6 +942,8 @@ class SchedulerBatchResultProcessor:
                 req.multimodal_inputs.release_features()
             self._maybe_collect_routed_experts(req)
             self._maybe_dump_gate_scores(req)
+            self._maybe_dump_credit(req)
+            self._maybe_dump_blaze(req)
             self._maybe_collect_indexer_topk(req)
 
             if self.server_args.disaggregation_decode_enable_offload_kvcache:
