@@ -1389,6 +1389,11 @@ class ModelRunner:
             else contextlib.nullcontext()
         )
 
+        # Pre-forward hook: the credit router snapshots the live batch size for its
+        # in-graph padding mask before a potential CUDA-graph replay.
+        if (credit_router := get_global_credit_router()) is not None:
+            credit_router.on_forward_start(forward_batch=forward_batch)
+
         with (
             canary_ctx,
             step_span_ctx,

@@ -18,6 +18,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.topk import TopKOutputChecker
+from sglang.srt.model_executor.forward_batch_info import enable_num_token_non_padded
 from sglang.srt.state_capturer.credit import get_global_credit_capturer
 
 if TYPE_CHECKING:
@@ -101,6 +102,20 @@ class CreditRouter:
         self.max_cred_row = torch.full(
             (num_experts,), max_cred, dtype=torch.int32, device=device
         )
+        # Live (un-padded) row count for the padding mask: written eagerly by
+        # on_forward_start before every forward, read inside the captured graph.
+        # forward_batch.num_token_non_padded cannot serve this purpose on single GPU:
+        # the decode graph runner attaches its static buffer to the captured batch
+        # unconditionally, but the buffer registry refreshes it per replay only when
+        # moe_ep_size > 1, so at replay it holds the LAST captured shape's size (= 1,
+        # capture runs largest-to-smallest) and would mask out almost every real row.
+        # Initialized to 0 so capture/warmup dummy forwards mask every row and leave
+        # the credit state untouched.
+        self._num_valid = torch.zeros(1, dtype=torch.int32, device=device)
+        # With moe_ep_size > 1 the num_token_non_padded slot IS registry-refreshed
+        # (and counts the DP-gathered token layout, which _num_valid does not), so
+        # prefer it there. Python constant -> capture-stable branch.
+        self.use_ntn = enable_num_token_non_padded()
         # Optional debug counters (SGLANG_CREDIT_DEBUG): accumulated on-device INSIDE the
         # captured graph and flushed per forward, so they reflect what actually happens at
         # replay. Layout: [decode_layer_calls, reset_layer_calls, credits_spent, replaced].
@@ -109,6 +124,16 @@ class CreditRouter:
         self._dbg = torch.zeros(6, dtype=torch.int64, device=device) if self.debug else None
         self._dbg_totals = [0, 0, 0, 0, 0, 0]
         self._dbg_steps = 0
+
+    def on_forward_start(self, *, forward_batch: "ForwardBatch") -> None:
+        """Record the live (un-padded) batch size for the in-graph padding mask.
+
+        Called eagerly (outside any CUDA graph) before every forward, so a graph
+        replay reads this step's real row count. IDLE batches have batch_size 0,
+        which masks every row: a replayed decode graph then touches no state, matching
+        the eager IDLE no-op.
+        """
+        self._num_valid.fill_(forward_batch.batch_size)
 
     def route(
         self,
@@ -127,12 +152,13 @@ class CreditRouter:
         if not forward_batch.forward_mode.is_decode():
             # Prefill/extend: route vanilla and (re)initialize this layer's credit rows to
             # max_cred so decode starts fresh (idempotent across prefill chunks). Gated to
-            # extend so idle/verify batches don't touch state.
-            # NOTE: under a padded extend CUDA graph on single GPU the ZERO-padded tail
-            # (req_pool_indices == 0) can also reset pool-slot-0's credits -- bounded to one
-            # slot and benign (reset toward max), unlike the depleting decode path.
+            # extend so idle/verify batches don't touch state. Padded rows (only present
+            # under a padded extend CUDA graph or its capture) are redirected to the
+            # pad_slot sink so they can never reset a live request's credits.
             if forward_batch.forward_mode.is_extend():
-                self.creds[idx, layer_id, :] = self.max_cred_row
+                valid = torch.arange(idx.shape[0], device=idx.device) < self._num_valid
+                safe_idx = torch.where(valid, idx, torch.full_like(idx, self.pad_slot))
+                self.creds[safe_idx, layer_id, :] = self.max_cred_row
                 if self.debug:
                     self._dbg[1] += 1
             return topk_output
@@ -150,20 +176,21 @@ class CreditRouter:
         B = router_logits.shape[0]
         device = router_logits.device
 
-        # Real vs padded rows. Prefer the explicit non-padded count (only populated when
-        # moe_ep_size > 1). Otherwise DO NOT mask from forward_batch scalar-array fields:
-        # empirically, both `positions` and `seq_lens` read as their padded/fill values for
-        # real rows in this hybrid-mamba model's decode CUDA graph (they are not refreshed
-        # the way attention's own buffers are), which silently dropped ~99% of real rows and
-        # made credit routing a no-op. All-True is correct for the common single-GPU case:
-        # the decode batch is padded only up to the next captured graph size (~1 padded row
-        # at bs 127->128), so the residual pool-slot-0 artifact from those few padded rows
-        # (all req_pool_indices == 0) is negligible.
+        # Real vs padded rows. Only when moe_ep_size > 1 is num_token_non_padded a
+        # registry-refreshed graph slot that is safe to read in-graph. On single GPU
+        # the captured batch still carries the buffer, but nothing refreshes it at
+        # replay -- it permanently holds the LAST captured shape's size (1), which
+        # silently dropped ~99% of real rows and made credit routing a no-op under
+        # CUDA graphs (this, not stale positions/seq_lens, was the root cause; both
+        # of those ARE refreshed per replay in this tree). Use the router-owned
+        # _num_valid instead: written eagerly before every forward, so padded tail
+        # rows (req_pool_indices == 0) are diverted to the pad_slot sink and pool
+        # slot 0's live credits are never touched.
         ntn = forward_batch.num_token_non_padded
-        if ntn is not None:
+        if self.use_ntn and ntn is not None:
             valid = torch.arange(B, device=device) < ntn  # [B] bool
         else:
-            valid = torch.ones(B, dtype=torch.bool, device=device)
+            valid = torch.arange(B, device=device) < self._num_valid  # [B] bool
         valid_i = valid.view(B, 1).to(torch.int32)
         safe_idx = torch.where(valid, idx, torch.full_like(idx, self.pad_slot))
 
