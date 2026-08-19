@@ -33,6 +33,7 @@ from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.state_capturer.gate_scores import get_global_gate_scores_capturer
 from sglang.srt.state_capturer.credit import get_global_credit_capturer
 from sglang.srt.state_capturer.blaze import get_global_blaze_capturer
+from sglang.srt.state_capturer.cai import get_global_cai_capturer
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -175,6 +176,7 @@ class SchedulerBatchResultProcessor:
             seqlen=seqlen,
             req_to_token_pool=self.req_to_token_pool,
         )  # [seqlen-1, num_layers, 2*k] int16; decode rows carry post-credit ids+creds
+        record = capturer.apply_retract_snapshot(rid=req.rid, record=record)
         capturer.dump(
             rid=req.rid,
             record=record,
@@ -192,6 +194,25 @@ class SchedulerBatchResultProcessor:
             seqlen=seqlen,
             req_to_token_pool=self.req_to_token_pool,
         )  # [seqlen-1, num_layers, k] int16; decode rows carry post-blaze ids
+        record = capturer.apply_retract_snapshot(rid=req.rid, record=record)
+        capturer.dump(
+            rid=req.rid,
+            record=record,
+            input_len=len(req.origin_input_ids),
+            output_len=len(req.output_ids_through_stop),
+        )
+
+    def _maybe_dump_cai(self, req: Req):
+        capturer = get_global_cai_capturer()
+        if capturer is None:
+            return
+        seqlen = len(req.origin_input_ids) + len(req.output_ids_through_stop)
+        record = capturer.get_topk(
+            req_pool_idx=req.req_pool_idx,
+            seqlen=seqlen,
+            req_to_token_pool=self.req_to_token_pool,
+        )  # [seqlen-1, num_layers, 2*k] int16; decode rows carry post-cai ids+weights
+        record = capturer.apply_retract_snapshot(rid=req.rid, record=record)
         capturer.dump(
             rid=req.rid,
             record=record,
@@ -294,6 +315,7 @@ class SchedulerBatchResultProcessor:
                         self._maybe_dump_gate_scores(req)
                         self._maybe_dump_credit(req)
                         self._maybe_dump_blaze(req)
+                        self._maybe_dump_cai(req)
                         self._maybe_collect_indexer_topk(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
@@ -944,6 +966,7 @@ class SchedulerBatchResultProcessor:
             self._maybe_dump_gate_scores(req)
             self._maybe_dump_credit(req)
             self._maybe_dump_blaze(req)
+            self._maybe_dump_cai(req)
             self._maybe_collect_indexer_topk(req)
 
             if self.server_args.disaggregation_decode_enable_offload_kvcache:

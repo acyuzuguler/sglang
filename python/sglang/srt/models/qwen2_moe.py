@@ -62,6 +62,7 @@ from sglang.srt.layers.moe import (
     should_skip_post_experts_all_reduce,
 )
 from sglang.srt.layers.moe.blaze_router import get_global_blaze_router
+from sglang.srt.layers.moe.cai_router import get_global_cai_router
 from sglang.srt.layers.moe.credit_router import get_global_credit_router
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -503,11 +504,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 torch.softmax(router_logits.float(), dim=-1).to(torch.float16),
             )
 
-        # Credit and blaze are mutually exclusive (asserted at startup); both
-        # implement the same route() contract.
+        # Credit, blaze and cai are mutually exclusive (asserted at
+        # startup); all implement the same route() contract.
         router = get_global_credit_router()
         if router is None:
             router = get_global_blaze_router()
+        if router is None:
+            router = get_global_cai_router()
         if router is not None and forward_batch is not None:
             topk_output = router.route(
                 layer_id=self.layer_id,

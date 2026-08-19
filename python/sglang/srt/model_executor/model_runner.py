@@ -198,10 +198,20 @@ from sglang.srt.layers.moe.blaze_router import (
     get_global_blaze_router,
     set_global_blaze_router,
 )
+from sglang.srt.layers.moe.cai_router import (
+    CaiRouter,
+    get_global_cai_router,
+    set_global_cai_router,
+)
 from sglang.srt.state_capturer.blaze import (
     BlazeCapturer,
     get_global_blaze_capturer,
     set_global_blaze_capturer,
+)
+from sglang.srt.state_capturer.cai import (
+    CaiCapturer,
+    get_global_cai_capturer,
+    set_global_cai_capturer,
 )
 from sglang.srt.state_capturer.gate_scores import (
     GateScoresCapturer,
@@ -794,6 +804,8 @@ class ModelRunner:
         self.init_credit_capturer()
         self.init_blaze_router()
         self.init_blaze_capturer()
+        self.init_cai_router()
+        self.init_cai_capturer()
         self.init_routed_experts_capturer()
 
         self.init_indexer_capturer()
@@ -942,6 +954,29 @@ class ModelRunner:
             return
         set_global_blaze_capturer(
             BlazeCapturer.create(
+                model_config=self.model_config,
+                num_tokens=self.max_total_num_tokens + self.page_size,
+                max_running_requests=self.max_running_requests,
+                device=self.device,
+            )
+        )
+
+    def init_cai_router(self):
+        if self.is_draft_worker:
+            return
+        set_global_cai_router(
+            CaiRouter.create(
+                model_config=self.model_config,
+                max_running_requests=self.max_running_requests,
+                device=self.device,
+            )
+        )
+
+    def init_cai_capturer(self):
+        if self.is_draft_worker:
+            return
+        set_global_cai_capturer(
+            CaiCapturer.create(
                 model_config=self.model_config,
                 num_tokens=self.max_total_num_tokens + self.page_size,
                 max_running_requests=self.max_running_requests,
@@ -1425,6 +1460,21 @@ class ModelRunner:
             and (blaze_capturer := get_global_blaze_capturer()) is not None
         ):
             blaze_capturer.on_forward_end(
+                forward_batch=forward_batch,
+                can_run_graph=output.can_run_graph,
+                cuda_graph_batch=getattr(self.decode_cuda_graph_runner, "bs", None),
+                no_copy_to_cpu=False,  # factory asserts --disable-overlap-schedule
+            )
+
+        if (cai_router := get_global_cai_router()) is not None:
+            cai_router.on_forward_end(forward_batch=forward_batch)
+
+        if (
+            not self.is_draft_worker
+            and forward_batch.forward_mode.is_decode()  # capacity buffer is decode-only
+            and (cai_capturer := get_global_cai_capturer()) is not None
+        ):
+            cai_capturer.on_forward_end(
                 forward_batch=forward_batch,
                 can_run_graph=output.can_run_graph,
                 cuda_graph_batch=getattr(self.decode_cuda_graph_runner, "bs", None),

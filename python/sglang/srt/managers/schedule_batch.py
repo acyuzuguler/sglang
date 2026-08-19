@@ -2621,6 +2621,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             idx = sorted_indices.pop()
             req = self.reqs[idx]
             retracted_reqs.append(req)
+            # Decode-only capturers (credit/blaze/cai) must snapshot this
+            # request's records now: release_req frees its kv slots, and the
+            # re-prefill after retraction never rewrites those host-cache rows.
+            from sglang.srt.state_capturer.base import (
+                snapshot_decode_records_on_retract,
+            )
+
+            snapshot_decode_records_on_retract(
+                rid=req.rid,
+                req_pool_idx=req.req_pool_idx,
+                seqlen=len(req.origin_input_ids) + len(req.output_ids),
+                req_to_token_pool=self.req_to_token_pool,
+            )
             # release memory and don't insert into the tree because we need the space instantly
             self.release_req(idx, len(sorted_indices), server_args)
 

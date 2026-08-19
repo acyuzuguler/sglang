@@ -126,6 +126,12 @@ class BaseTopkCapturer:
             name=name,
             dtype=dtype
         )
+        # rid -> [rows, num_layers, topk_size] records saved at retraction time.
+        # A retracted request re-prefills its generated-so-far tokens into NEW
+        # kv slots; a decode-only capturer never rewrites the host_cache rows
+        # for that span, so without this snapshot the pre-retraction part of
+        # the dump reads whatever request previously owned those slots.
+        self._retract_snapshots = {}
 
     def capture(self, layer_id: int, topk_indices: torch.Tensor):
         self.device_cache.capture(layer_id, topk_indices)
@@ -164,6 +170,41 @@ class BaseTopkCapturer:
         )
         return self.host_cache.buffer[cache_pool_idx]
 
+    def on_retract(
+        self,
+        *,
+        rid: str,
+        req_pool_idx: int,
+        seqlen: int,
+        req_to_token_pool: ReqToTokenPool,
+    ):
+        """Snapshot this request's rows BEFORE its kv slots are released.
+
+        Across repeated retractions, host_cache rows written before an earlier
+        retraction are already stale (see __init__ note), so the earlier
+        snapshot wins for its span and only the rows beyond it are taken fresh.
+        """
+        rows = self.get_topk(
+            req_pool_idx=req_pool_idx,
+            seqlen=seqlen,
+            req_to_token_pool=req_to_token_pool,
+        )  # advanced indexing -> already an owning copy
+        prev = self._retract_snapshots.get(rid)
+        if prev is not None and rows.shape[0] > prev.shape[0]:
+            rows = torch.cat([prev, rows[prev.shape[0] :]])
+        elif prev is not None:
+            rows = prev
+        self._retract_snapshots[rid] = rows
+
+    def apply_retract_snapshot(self, *, rid: str, record: torch.Tensor) -> torch.Tensor:
+        """Splice the pre-retraction rows back into a freshly gathered record
+        at dump time; pops the snapshot. A no-op for never-retracted requests."""
+        snap = self._retract_snapshots.pop(rid, None)
+        if snap is None:
+            return record
+        n = min(snap.shape[0], record.shape[0])
+        return torch.cat([snap[:n], record[n:]])
+
     def on_forward_end(
         self,
         forward_batch: ForwardBatch,
@@ -187,3 +228,35 @@ class BaseTopkCapturer:
         out_cache_loc_cpu = forward_batch.out_cache_loc.cpu()
         self.host_cache.buffer[out_cache_loc_cpu] = slice_gpu.cpu()
         return None
+
+
+def snapshot_decode_records_on_retract(
+    *,
+    rid: str,
+    req_pool_idx: int,
+    seqlen: int,
+    req_to_token_pool: ReqToTokenPool,
+):
+    """Preserve a retracted request's per-token records before its kv slots
+    are released (call from the scheduler's retraction path).
+
+    Only the decode-only capturers (credit / blaze / cai) need this: the
+    gate-scores capturer also records during prefill, so re-prefilling the
+    generated-so-far tokens rewrites its rows correctly."""
+    from sglang.srt.state_capturer.blaze import get_global_blaze_capturer
+    from sglang.srt.state_capturer.cai import get_global_cai_capturer
+    from sglang.srt.state_capturer.credit import get_global_credit_capturer
+
+    for get_capturer in (
+        get_global_credit_capturer,
+        get_global_blaze_capturer,
+        get_global_cai_capturer,
+    ):
+        capturer = get_capturer()
+        if capturer is not None:
+            capturer.on_retract(
+                rid=rid,
+                req_pool_idx=req_pool_idx,
+                seqlen=seqlen,
+                req_to_token_pool=req_to_token_pool,
+            )

@@ -409,6 +409,10 @@ class Resources(_FlagGroupBase):
     blaze_router: Any = None
     # Per-request post-blaze routing capturer (installed when SGLANG_LOG_BLAZE_DIR set).
     blaze_capturer: Any = None
+    # CAI capacity-aware (token drop / expanded drop) MoE router (SGLANG_CAI_ROUTER).
+    cai_router: Any = None
+    # Per-request post-cai routing capturer (installed when SGLANG_LOG_CAI_DIR set).
+    cai_capturer: Any = None
     # The shared TCPStore created during distributed initialization.
     tcp_store: Any = None
     # Trace verbosity; the accessor seeds it lazily from SGLANG_TRACE_LEVEL.

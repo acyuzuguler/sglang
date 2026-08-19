@@ -1,31 +1,42 @@
 # BLAZE MoE expert routing (Ran et al., "Bias-Driven Load-Aware Zero-Overhead Expert
 # Routing", MLSys'26): top-k over load-penalized routing scores. Ported from the
 # offline simulator in eval/sim_blaze.py, with the online EMA load tracker replaced by
-# a STATIC load profile read from SGLANG_BLAZE_LOAD_FILE (simulates a warmed-up
-# deployment). Gated to the qwen3.5-moe model and enabled by SGLANG_BLAZE_ROUTER; a
-# no-op for every other model / when off.
+# per-sample load profiles inferred from an offline large-cluster simulation
+# (SGLANG_BLAZE_GATE_SCORES_FILE, the same dump the CAI router consumes: a dict
+# {iteration -> [T_s, L, E] post-softmax gate scores} produced by eval/sim/run_sim.py
+# -- see sim_gate_scores.py). At init every sim sample is reduced to its vanilla
+# top-k selection counts per (layer, expert), normalized to per-layer mean 1 (Eq. 5).
+# At decode time a request is penalized with the sim sample matching its own
+# decoded-token count:
+#   sample = (decode_pos // sample_period) % num_samples
+# with sample_period inferred from the spacing of the recorded iteration ids (first
+# decoded token -> sample 0; wraps past the last sample). Gated to the qwen3.5-moe
+# model and enabled by SGLANG_BLAZE_ROUTER; a no-op for every other model / when off.
 #
 # Per token and layer: r = s - alpha * load picks the experts (Eq. 2), an affinity
 # guardrail pins the original top-1 where the top1-top2 gap exceeds tau (Eq. 7), and
 # the mixture weights always come from the unpenalized scores of the selected set
 # (Eq. 4). The simulator runs on s = log(softmax(logits)); raw router logits differ
 # from that by the per-token constant logsumexp, which cancels in rankings, gaps,
-# margins, and the selected-set softmax, so the same alpha/tau transfer unchanged.
+# and the selected-set softmax, so the same alpha/tau transfer unchanged. alpha is
+# SGLANG_BLAZE_ALPHA, fixed for the whole run (the paper's two-tier safety monitor
+# that adapts alpha was removed; every experiment ran the "fixed" policy).
 #
-# Decode-only and stateless per token (prefill routes vanilla; there is no per-request
-# state), so unlike the credit router no CUDA-graph padding handling is needed: padded
-# rows compute routing whose outputs are discarded, exactly as with vanilla topk. The
-# only mutable state belongs to the paper's two-tier safety monitor (enabled when
-# SGLANG_BLAZE_ALPHA_POLICY != "fixed"): alpha lives in a 0-dim device tensor read
-# inside the captured graph and rewritten between replays, and route() accumulates
-# violation counters plus Eq. 8 routing margins on-device, which the host-side
-# on_forward_end() driver consumes at cycle boundaries.
+# Decode-only (prefill routes vanilla). The per-slot decode-position counter is
+# maintained eagerly in on_forward_end (called with the real, un-padded forward_batch
+# after every forward): reset to 0 on extend (idempotent across chunked-prefill
+# chunks; a retracted request restarts at sample 0 on re-prefill), incremented after
+# each decode forward. All decode-path ops are fixed-shape (per-token load gather,
+# penalized topk) and the counter/load buffers are persistent device tensors written
+# eagerly between replays, so the routing is CUDA-graph safe: padded graph rows read
+# pool slot 0's counter (ZERO padding policy), their outputs are discarded, and
+# nothing is written.
 #
 # NOTE: RoutedExpertsCapturer / the expert-distribution recorder fire inside
 # vanilla_topk and therefore record PRE-blaze ids; the actual post-blaze routing is
 # recorded by BlazeCapturer (SGLANG_LOG_BLAZE_DIR). Do not combine with speculative
-# decoding: the MTP draft model shares the process-global router and would be
-# penalized with layer 0's load profile.
+# decoding: the MTP draft model shares the process-global router and would corrupt
+# the per-slot decode positions.
 
 import logging
 from collections import Counter
@@ -34,6 +45,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.sim_gate_scores import open_sim_gate_scores, validate_sample
 from sglang.srt.layers.moe.topk import TopKOutputChecker
 from sglang.srt.state_capturer.blaze import get_global_blaze_capturer
 
@@ -43,19 +55,52 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Safety-monitor constants (paper Sec. 2.3, identical to eval/sim_blaze.py).
-CYCLE = 50  # monitor cycle length in decode steps
-DROP_THRESH = 1e-3  # hard-violation rate (top-1 expelled) -> alpha *= 0.5
-FLIP_THRESH = 0.05  # soft-violation rate (top-1 demoted) -> alpha *= 0.7
-SAFETY_MARGIN = 0.8  # m in the alpha_safe bound (Eq. 8)
 
-# How alpha is managed over the run (the paper leaves initialization/recovery
-# unspecified; these mirror the sim_blaze.py interpretations):
-#   fixed          alpha = SGLANG_BLAZE_ALPHA always; monitor fully disabled
-#   reset_safe     alpha = alpha_safe at each cycle start (closest to the paper)
-#   fixed_clamped  alpha = min(alpha0, alpha_safe) at each cycle start
-#   monotonic      alpha only ever clamped/backed off, never recovers
-ALPHA_POLICIES = ("fixed", "reset_safe", "fixed_clamped", "monotonic")
+def _compute_sim_loads(
+    *,
+    path: str,
+    num_layers: int,
+    num_experts: int,
+    top_k: int,
+    device: str,
+) -> tuple[torch.Tensor, int]:
+    """([S, L, E] float32 per-sample normalized load profiles (see header),
+    sample_period inferred from the recorded iteration ids).
+
+    Every sample is reduced to its vanilla top-k selection counts per (layer,
+    expert) and normalized to per-layer mean 1 (Eq. 5), so the sim batch sizes
+    cancel and only the shape of each load distribution matters. One sample is
+    cloned at a time and processed layer-by-layer on the device (~25 MB working
+    set) -- see open_sim_gate_scores for the mmap rationale.
+    """
+    data, keys, sample_period = open_sim_gate_scores(path=path)
+    loads = torch.empty(
+        (len(keys), num_layers, num_experts), dtype=torch.float32, device=device
+    )
+    for si, key in enumerate(keys):
+        sample = data[key]
+        validate_sample(
+            key=key, sample=sample, num_layers=num_layers, num_experts=num_experts
+        )
+        if sample.shape[0] == 0:
+            raise ValueError(f"sim gate scores sample {key} has no tokens.")
+        sample = sample.clone()  # one sequential read of the mmap'd sample
+        for layer in range(num_layers):
+            scores = sample[:, layer, :].to(device=device, dtype=torch.float32)
+            ids = torch.topk(scores, k=top_k, dim=-1).indices  # [T, k]
+            loads[si, layer] = torch.bincount(
+                ids.flatten(), minlength=num_experts
+            ).float()
+        logger.info(
+            "BlazeRouter: sim loads %d/%d (iteration %s, T=%d)",
+            si + 1,
+            len(keys),
+            key,
+            sample.shape[0],
+        )
+    # Normalized load (Eq. 5, per-(sample, layer) mean == 1); the mean is
+    # T * k / E > 0, so no zero-division guard is needed beyond the T check.
+    return loads / loads.mean(dim=-1, keepdim=True), sample_period
 
 
 class BlazeRouter:
@@ -68,9 +113,10 @@ class BlazeRouter:
     ) -> Optional["BlazeRouter"]:
         if not envs.SGLANG_BLAZE_ROUTER.get():
             return None
-        if envs.SGLANG_CREDIT_ROUTER.get():
+        if envs.SGLANG_CREDIT_ROUTER.get() or envs.SGLANG_CAI_ROUTER.get():
             raise ValueError(
-                "SGLANG_BLAZE_ROUTER and SGLANG_CREDIT_ROUTER are mutually exclusive."
+                "SGLANG_BLAZE_ROUTER is mutually exclusive with "
+                "SGLANG_CREDIT_ROUTER and SGLANG_CAI_ROUTER."
             )
         tc = model_config.hf_text_config
         if tc.model_type != "qwen3_5_moe_text":
@@ -78,120 +124,89 @@ class BlazeRouter:
                 "SGLANG_BLAZE_ROUTER is set but the model is not qwen3_5_moe; "
                 "blaze routing disabled."
             )
-        load_file = envs.SGLANG_BLAZE_LOAD_FILE.get()
-        if load_file:
-            counts = torch.load(load_file, map_location="cpu")
-            if isinstance(counts, dict):
-                counts = counts["loads"]
-        else:
-            # No profile: uniform counts normalize to load == 1 for every expert, so
-            # the penalty is constant across experts and routing stays EXACTLY
-            # vanilla. Only useful as a smoke test of the blaze machinery; a real
-            # balancing run needs a measured profile (eval/sim_batched.py dump).
-            counts = torch.ones(tc.num_hidden_layers, tc.num_experts)
-            logger.warning(
-                "SGLANG_BLAZE_LOAD_FILE is unset: using a uniform load profile, "
-                "which makes blaze routing identical to vanilla (no balancing)."
+        gate_scores_file = envs.SGLANG_BLAZE_GATE_SCORES_FILE.get()
+        if not gate_scores_file:
+            raise ValueError(
+                "SGLANG_BLAZE_ROUTER needs SGLANG_BLAZE_GATE_SCORES_FILE (the sim "
+                "population that per-sample load profiles are computed from)."
             )
         router = BlazeRouter(
-            counts=counts,
+            gate_scores_file=gate_scores_file,
             num_layers=tc.num_hidden_layers,
             num_experts=tc.num_experts,
             top_k=tc.num_experts_per_tok,
-            alpha0=envs.SGLANG_BLAZE_ALPHA.get(),
+            alpha=envs.SGLANG_BLAZE_ALPHA.get(),
             tau=envs.SGLANG_BLAZE_TAU.get(),
-            alpha_policy=envs.SGLANG_BLAZE_ALPHA_POLICY.get(),
             max_running_requests=max_running_requests,
             device=device,
         )
         logger.info(
-            "BlazeRouter enabled: layers=%d experts=%d k=%d alpha0=%.4f tau=%.4f "
-            "policy=%s load_file=%s norm_load[max=%.2f]",
+            "BlazeRouter enabled: layers=%d experts=%d k=%d alpha=%.4f tau=%.4f "
+            "num_samples=%d sample_period=%d (inferred from the recorded "
+            "iteration ids) gate_scores_file=%s norm_load[max=%.2f]",
             tc.num_hidden_layers,
             tc.num_experts,
             tc.num_experts_per_tok,
-            router.alpha0,
+            router.alpha,
             router.tau,
-            router.alpha_policy,
-            load_file,
-            router.load_max,
+            router.num_samples,
+            router.sample_period,
+            gate_scores_file,
+            router.load.max().item(),
         )
         return router
 
     def __init__(
         self,
         *,
-        counts: torch.Tensor,
+        gate_scores_file: str,
         num_layers: int,
         num_experts: int,
         top_k: int,
-        alpha0: float,
+        alpha: float,
         tau: float,
-        alpha_policy: str,
         max_running_requests: int,
         device: str,
     ):
-        if not isinstance(counts, torch.Tensor) or tuple(counts.shape) != (
-            num_layers,
-            num_experts,
-        ):
-            raise ValueError(
-                f"BLAZE load file must hold a [{num_layers}, {num_experts}] tensor, "
-                f"got {type(counts).__name__} with shape "
-                f"{tuple(counts.shape) if isinstance(counts, torch.Tensor) else '?'}"
-            )
-        if alpha_policy not in ALPHA_POLICIES:
-            raise ValueError(
-                f"unknown SGLANG_BLAZE_ALPHA_POLICY {alpha_policy!r}; "
-                f"expected one of {ALPHA_POLICIES}"
-            )
-        counts = counts.float()
-        if (counts < 0).any():
-            raise ValueError("BLAZE load counts must be non-negative.")
-        layer_means = counts.mean(dim=-1, keepdim=True)  # [L, 1]
-        if (layer_means <= 0).any():
-            raise ValueError("BLAZE load file has a layer with zero total count.")
-
         self.top_k = top_k
         self.tau = tau
-        self.alpha0 = alpha0
-        self.alpha = alpha0  # host copy; the monitor mutates it and mirrors to alpha_t
-        self.alpha_policy = alpha_policy
-        self.monitor = alpha_policy != "fixed"
+        self.alpha = alpha  # fixed for the whole run
         self.debug = envs.SGLANG_BLAZE_DEBUG.get()
 
-        # Normalized load (Eq. 5, per-layer mean == 1), constant for the whole run.
-        load = counts / layer_means
-        self.load = load.to(device=device, dtype=torch.float32)  # [L, E]
-        self.load_max = load.max().item()  # static denominator of Eq. 8
-        # alpha is read inside the (captured) forward but adjusted by the monitor
-        # between replays, so it lives in a 0-dim device tensor, not a python float.
-        self.alpha_t = torch.tensor(alpha0, dtype=torch.float32, device=device)
+        # [S, L, E] per-sample normalized loads from the sim population (see
+        # header); the sample period is inferred from the recorded iteration ids.
+        self.load, sample_period = _compute_sim_loads(
+            path=gate_scores_file,
+            num_layers=num_layers,
+            num_experts=num_experts,
+            top_k=top_k,
+            device=device,
+        )
+        # Python ints so the modulo/div in the decode path are graph-safe
+        # constants.
+        self.num_samples = self.load.shape[0]
+        self.sample_period = sample_period
 
-        # On-device counters accumulated INSIDE the captured graph, read + zeroed
-        # host-side by on_forward_end after every decode forward. Layout:
+        # Per-request-slot decoded-token counter (+ one spare row so an
+        # out-of-range pool index could never alias a live request). Written
+        # eagerly in on_forward_end with the real forward_batch, read inside
+        # the captured graph via the ZERO-padded req_pool_indices buffer.
+        self._decode_pos = torch.zeros(
+            max_running_requests + 1, dtype=torch.int64, device=device
+        )
+
+        # On-device debug counters accumulated INSIDE the captured graph, read +
+        # zeroed host-side by on_forward_end after every decode forward. Layout:
         # [layer_calls, tokens, locked, dropped, flipped, replaced_slots].
         # Under a padded decode graph they include the padded tail rows (~1 row at
         # bs 127->128); do NOT mask via forward_batch scalar-array fields
         # (positions/seq_lens are not refreshed in this hybrid-mamba model's decode
         # graph -- see the credit router's padding notes).
         self._stats = (
-            torch.zeros(6, dtype=torch.int64, device=device)
-            if (self.monitor or self.debug)
-            else None
+            torch.zeros(6, dtype=torch.int64, device=device) if self.debug else None
         )
-        # Per-layer routing margins s_top1 - s_top(k+1) of the latest decode forward,
-        # for the Eq. 8 quantile (host slices [:, :batch_size] to skip padded rows).
-        self._margins = (
-            torch.zeros(
-                num_layers, max_running_requests, dtype=torch.float32, device=device
-            )
-            if self.monitor
-            else None
-        )
-        # Host-side monitor/debug state (only touched between forwards).
+        # Host-side debug state (only touched between forwards).
         self._t = 0
-        self._window = Counter()
         self._totals = Counter()
 
     def route(
@@ -207,18 +222,29 @@ class BlazeRouter:
         # for the downstream expert kernels, and is the prefill / fallback path.
         topk_output = vanilla_topk(hidden_states, router_logits)
         if not forward_batch.forward_mode.is_decode():
-            # Prefill/extend routes vanilla; the static profile has no state to reset.
+            # Prefill/extend routes vanilla by design (counter reset happens in
+            # on_forward_end).
             return topk_output
         if not TopKOutputChecker.format_is_standard(topk_output):
             # Unexpected MoE backend (bypassed / triton-kernels); leave vanilla untouched.
             return topk_output
-        return self._route_decode(layer_id, router_logits, topk_output)
+        if router_logits.shape[0] != forward_batch.req_pool_indices.shape[0]:
+            raise RuntimeError(
+                "BLAZE routing expects the one-token-per-request decode layout; "
+                f"got {router_logits.shape[0]} rows for "
+                f"{forward_batch.req_pool_indices.shape[0]} requests."
+            )
+        return self._route_decode(layer_id, router_logits, forward_batch, topk_output)
 
-    def _route_decode(self, layer_id, router_logits, template):
+    def _route_decode(self, layer_id, router_logits, forward_batch, template):
         s = router_logits.float()  # [B, E]
-        # Load-penalized scores (Eq. 2): static per-layer row, alpha from the device
-        # scalar so monitor updates between graph replays take effect.
-        r = s - self.alpha_t * self.load[layer_id]
+        # Load-penalized scores (Eq. 2): each request is penalized with the sim
+        # sample matching its own decode position (see header). Padded graph rows
+        # read pool slot 0's counter, their outputs are discarded, and nothing is
+        # written.
+        idx = forward_batch.req_pool_indices.long()  # [B]
+        smp = (self._decode_pos[idx] // self.sample_period) % self.num_samples  # [B]
+        r = s - self.alpha * self.load[smp, layer_id]  # [B, E]
 
         # Affinity guardrail (Eq. 7): pin the original top-1 where the top1-top2 gap
         # exceeds tau. masked_fill fills with a python scalar on-device (CUDA-graph
@@ -252,10 +278,6 @@ class BlazeRouter:
             self._stats[3] += (~kept_any).sum()  # dropped: original top-1 expelled
             self._stats[4] += (kept_any & ~kept[:, 0]).sum()  # flipped: kept, demoted
             self._stats[5] += replaced.sum()
-        if self._margins is not None and s.shape[0] <= self._margins.shape[1]:
-            # Routing margin top-1 vs first rejected expert for the Eq. 8 quantile.
-            top_s = torch.topk(s, self.top_k + 1, dim=-1).values
-            self._margins[layer_id, : s.shape[0]] = top_s[:, 0] - top_s[:, -1]
 
         return template._replace(
             topk_weights=weights.to(template.topk_weights.dtype),
@@ -263,15 +285,25 @@ class BlazeRouter:
         )
 
     def on_forward_end(self, *, forward_batch: "ForwardBatch"):
-        """Host-side safety-monitor driver + debug logger (call outside the graph).
+        """Per-slot decode-position bookkeeping + host-side debug logger.
 
-        Mirrors the sim's cycle logic: proactive alpha_safe clamp at each cycle
-        start, violation sampling on cycle steps {0, 1}, reactive backoff on step 2.
-        One deviation: the clamp already applies at t=0 (the static profile is warm;
-        the sim skips t=0 only because its EMA is still all-zero there). Fixed-alpha
-        runs without debug return immediately (no per-step host sync).
+        Called eagerly (outside any CUDA graph) after every forward with the
+        real, un-padded forward_batch. Non-debug runs do only the counter
+        update (no per-step host sync).
         """
-        if self._stats is None or not forward_batch.forward_mode.is_decode():
+        fm = forward_batch.forward_mode
+        if fm.is_extend():
+            # A new request (or a retracted one being re-prefilled) now owns
+            # these slots: restart its sim-iteration clock. Idempotent across
+            # chunked-prefill chunks.
+            self._decode_pos[forward_batch.req_pool_indices.long()] = 0
+        elif fm.is_decode():
+            # Increment AFTER the forward that consumed the value, so the
+            # first decode forward reads 0 (sample 0) and decode_pos always
+            # equals the number of tokens decoded so far.
+            self._decode_pos[forward_batch.req_pool_indices.long()] += 1
+
+        if self._stats is None or not fm.is_decode():
             return
         d = self._stats.tolist()
         self._stats.zero_()
@@ -280,47 +312,8 @@ class BlazeRouter:
         ):
             self._totals[key] += val
 
-        t = self._t
         self._t += 1
-
-        if self.monitor:
-            if t % CYCLE == 0:
-                # Proactive clamp (Eq. 8): 10th-percentile routing margin over the
-                # real rows of the latest decode forward, against the max load.
-                margin = self._margins[:, : forward_batch.batch_size]
-                alpha_safe = (
-                    SAFETY_MARGIN * torch.quantile(margin, 0.1).item() / self.load_max
-                )
-                if self.alpha_policy == "reset_safe":
-                    self.alpha = alpha_safe
-                elif self.alpha_policy == "fixed_clamped":
-                    self.alpha = min(self.alpha0, alpha_safe)
-                elif self.alpha_policy == "monotonic":
-                    self.alpha = min(self.alpha, alpha_safe)
-                self.alpha_t.fill_(self.alpha)
-            if t % CYCLE in (0, 1):
-                for key, val in (("tokens", d[1]), ("dropped", d[3]), ("flipped", d[4])):
-                    self._window[key] += val
-            elif t % CYCLE == 2 and self._window["tokens"] > 0:
-                # Reactive violation-driven backoff over the sampling window.
-                if self._window["dropped"] / self._window["tokens"] > DROP_THRESH:
-                    self.alpha *= 0.5
-                    self.alpha_t.fill_(self.alpha)
-                elif self._window["flipped"] / self._window["tokens"] > FLIP_THRESH:
-                    self.alpha *= 0.7
-                    self.alpha_t.fill_(self.alpha)
-                logger.info(
-                    "[blaze] t=%d alpha=%.4f window(%d tokens): dropped=%.4f%% "
-                    "flipped=%.4f%%",
-                    t,
-                    self.alpha,
-                    self._window["tokens"],
-                    100 * self._window["dropped"] / self._window["tokens"],
-                    100 * self._window["flipped"] / self._window["tokens"],
-                )
-                self._window.clear()
-
-        if self.debug and self._t % 50 == 0:
+        if self._t % 50 == 0:
             tot = self._totals
             tokens = max(tot["tokens"], 1)
             logger.info(

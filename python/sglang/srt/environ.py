@@ -667,26 +667,59 @@ class Envs:
     # Credit-based MoE routing (per-request load balancing; qwen3.5-moe only)
     SGLANG_CREDIT_ROUTER = EnvBool(False)
     SGLANG_CREDIT_MAX_CRED = EnvInt(240)
-    SGLANG_CREDIT_COST = EnvInt(8)
+    SGLANG_CREDIT_COST = EnvInt(4)
+    # Soft-bias strength: topk(scores + beta * creds/creds_rowmax * scores_rowmax)
+    SGLANG_CREDIT_BETA = EnvFloat(0.8)
     SGLANG_CREDIT_DEBUG = EnvBool(False)
     # Per-request dump of post-credit expert ids + selected-expert credits (qwen3.5-moe).
     SGLANG_LOG_CREDIT_DIR = EnvStr(None)
 
-    # BLAZE MoE routing (static load-penalized top-k, MLSys'26; qwen3.5-moe only)
+    # BLAZE MoE routing (sim-load-penalized top-k, MLSys'26; qwen3.5-moe only).
+    # The paper's online EMA load tracker is replaced by per-sample load
+    # profiles inferred from an offline cluster simulation, replayed per
+    # request by decode position (same mechanism and same file as
+    # SGLANG_CAI_GATE_SCORES_FILE).
     SGLANG_BLAZE_ROUTER = EnvBool(False)
+    # Bias strength, fixed for the whole run (the paper's safety monitor that
+    # adapts alpha is not implemented).
     SGLANG_BLAZE_ALPHA = EnvFloat(0.5)
     SGLANG_BLAZE_TAU = EnvFloat(1.5)
-    # Safety-monitor alpha policy: fixed | reset_safe | fixed_clamped | monotonic
-    # ("fixed" disables the monitor and keeps alpha = SGLANG_BLAZE_ALPHA).
-    SGLANG_BLAZE_ALPHA_POLICY = EnvStr("fixed")
-    # .pt file with per-layer per-expert load counts [num_layers, num_experts]
-    # (raw tensor or {"loads": tensor}); produced by eval/sim_batched.py.
-    # Unset -> uniform profile, which makes blaze routing exactly vanilla
-    # (smoke-test mode, no balancing).
-    SGLANG_BLAZE_LOAD_FILE = EnvStr(None)
+    # Required with SGLANG_BLAZE_ROUTER: .pt dict {iteration -> [T_s, L, E]
+    # post-softmax gate scores} from eval/sim/run_sim.py. At init, every sample
+    # is reduced to its vanilla top-k selection counts per (layer, expert),
+    # normalized to per-layer mean 1; the decode bias penalizes each request
+    # with the sample matching its own decoded-token count:
+    # sample = (decode_pos // period) % num_samples, with the period inferred
+    # from the spacing of the recorded iteration ids (wraps past the last).
+    SGLANG_BLAZE_GATE_SCORES_FILE = EnvStr(None)
     SGLANG_BLAZE_DEBUG = EnvBool(False)
     # Per-request dump of post-blaze expert ids (qwen3.5-moe).
     SGLANG_LOG_BLAZE_DIR = EnvStr(None)
+
+    # CAI (capacity-aware inference) MoE routing: per-expert capacity cap with
+    # score-based token drop / expanded drop (ICLR'26; qwen3.5-moe only).
+    # SIM-THRESHOLD mode (our serving adaptation): the competing population is
+    # an offline cluster simulation instead of the local decode batch.
+    SGLANG_CAI_ROUTER = EnvBool(False)
+    # Capacity factor gamma: per-expert cap C_s = ceil(gamma * top_k * T_s / E)
+    # where T_s is the sim sample's token count.
+    SGLANG_CAI_GAMMA = EnvFloat(1.0)
+    # Candidate overselect multiplier: each token nominates ceil(top_k * rounds)
+    # candidate experts before the cap; 1 = pure Token Drop, >1 = Expanded Drop.
+    SGLANG_CAI_ROUNDS = EnvInt(1)
+    # Required with SGLANG_CAI_ROUTER: .pt dict {iteration -> [T_s, L, E]
+    # post-softmax gate scores} from eval/sim/run_sim.py. At init, per-sample
+    # per-expert score thresholds are computed (the C_s-th highest sim-candidate
+    # score, -inf if the expert has fewer than C_s candidates); a real decode
+    # assignment survives iff its score is strictly above the threshold. Each
+    # sample stands in for `period` decode iterations of a request, where the
+    # period is inferred from the spacing of the recorded iteration ids:
+    # sample = (decode_pos // period) % num_samples (wraps past the last).
+    SGLANG_CAI_GATE_SCORES_FILE = EnvStr(None)
+    SGLANG_CAI_DEBUG = EnvBool(False)
+    # Per-request dump of post-cai expert ids (-1 = dropped slot) + weights
+    # (qwen3.5-moe).
+    SGLANG_LOG_CAI_DIR = EnvStr(None)
 
     # TBO
     SGLANG_TBO_DEBUG = EnvBool(False)
