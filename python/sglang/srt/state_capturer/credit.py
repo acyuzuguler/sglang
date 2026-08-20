@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.router_hook import resolve_moe_router_dims
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.state_capturer.base import BaseTopkCapturer
 
@@ -41,12 +42,9 @@ class CreditCapturer(BaseTopkCapturer):
         dump_dir = envs.SGLANG_LOG_CREDIT_DIR.get()
         if not dump_dir:
             return None
-        tc = model_config.hf_text_config
-        if tc.model_type != "qwen3_5_moe_text":
-            raise ValueError(
-                "SGLANG_LOG_CREDIT_DIR set but model is not qwen3_5_moe; "
-                "credit capture disabled."
-            )
+        dims = resolve_moe_router_dims(
+            model_config=model_config, feature="SGLANG_LOG_CREDIT_DIR"
+        )
         server_args = get_server_args()
         assert server_args.disable_overlap_schedule, (
             "SGLANG_LOG_CREDIT_DIR requires --disable-overlap-schedule"
@@ -54,8 +52,8 @@ class CreditCapturer(BaseTopkCapturer):
         os.makedirs(dump_dir, exist_ok=True)
         return CreditCapturer(
             dump_dir=dump_dir,
-            num_layers=tc.num_hidden_layers,
-            top_k=tc.num_experts_per_tok,
+            num_layers=dims.num_layers,
+            top_k=dims.top_k,
             num_tokens=num_tokens,
             max_batch_size=max(
                 server_args.chunked_prefill_size, max_running_requests

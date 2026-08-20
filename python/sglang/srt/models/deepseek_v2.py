@@ -99,6 +99,7 @@ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
+from sglang.srt.layers.moe.router_hook import apply_moe_router_hook
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     CombineInput,
@@ -590,6 +591,10 @@ class DeepseekV2MoE(nn.Module):
 
         n_hash_layers = getattr(config, "num_hash_layers", 0)
         self.is_hash = layer_id < n_hash_layers and not (is_deepseek_v4 and is_nextn)
+        # Gate-score capture / credit-blaze-cai routing (router_hook) applies only
+        # to gate-routed target layers: hash layers have no gate scores (and a
+        # HashTopK without topk_config), nextn is the draft model.
+        self._moe_router_hook_enabled = not self.is_hash and not is_nextn
 
         if self.tp_size > config.n_routed_experts:
             raise ValueError(
@@ -906,6 +911,7 @@ class DeepseekV2MoE(nn.Module):
                     gemm_output_zero_allocator,
                     input_ids,
                     input_ids_global=input_ids_global,
+                    forward_batch=forward_batch,
                 )
             else:
                 return self.forward_normal(
@@ -914,6 +920,7 @@ class DeepseekV2MoE(nn.Module):
                     input_ids,
                     input_ids_global=input_ids_global,
                     skip_shared_experts=skip_shared_experts,
+                    forward_batch=forward_batch,
                 )
         else:
             return self.forward_deepep(
@@ -926,6 +933,7 @@ class DeepseekV2MoE(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
+        forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
         # Note(kpham-sgl): issue order satisfies 3 constraints:
         # - no stream explosion: main (routed) issued before alt block -> capture reuses 1 alt stream;
@@ -964,6 +972,15 @@ class DeepseekV2MoE(nn.Module):
                 expert_location_dispatch_info=dispatch_info,
                 **topk_kwargs,
             )
+            if self._moe_router_hook_enabled:
+                # Gate-score capture + credit/blaze/cai routing override.
+                topk_output = apply_moe_router_hook(
+                    layer_id=self.layer_id,
+                    router_logits=router_logits,
+                    forward_batch=forward_batch,
+                    topk_config=self.topk.topk_config,
+                    topk_output=topk_output,
+                )
         deferred_finalize = (
             has_shared_output
             and not self._shared_expert_tp1
@@ -1028,6 +1045,7 @@ class DeepseekV2MoE(nn.Module):
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
         skip_shared_experts: bool = False,
+        forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
@@ -1066,6 +1084,15 @@ class DeepseekV2MoE(nn.Module):
                 expert_location_dispatch_info=dispatch_info,
                 **topk_kwargs,
             )
+            if self._moe_router_hook_enabled:
+                # Gate-score capture + credit/blaze/cai routing override.
+                topk_output = apply_moe_router_hook(
+                    layer_id=self.layer_id,
+                    router_logits=router_logits,
+                    forward_batch=forward_batch,
+                    topk_config=self.topk.topk_config,
+                    topk_output=topk_output,
+                )
         else:
             shared_output = None
             topk_output = self.topk.empty_topk_output(

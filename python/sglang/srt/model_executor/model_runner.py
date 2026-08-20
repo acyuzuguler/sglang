@@ -218,6 +218,7 @@ from sglang.srt.state_capturer.gate_scores import (
     get_global_gate_scores_capturer,
     set_global_gate_scores_capturer,
 )
+from sglang.srt.layers.moe.router_hook import collect_gate_correction_bias_if_needed
 from sglang.srt.utils import (
     cpu_has_amx_support,
     enable_show_time_cost,
@@ -799,6 +800,7 @@ class ModelRunner:
         self.init_ngram_embedding_manager()
 
         self.maybe_init_hisparse_coordinator()
+        self.init_moe_gate_correction_bias()
         self.init_gate_scores_capturer()
         self.init_credit_router()
         self.init_credit_capturer()
@@ -903,6 +905,17 @@ class ModelRunner:
             )
         )
 
+    def init_moe_gate_correction_bias(self):
+        # [num_layers, num_experts] fp32 CPU noaux_tc gate bias (None when no
+        # bias-consuming feature is on or the model has none); consumed by the
+        # gate-scores capturer dump and the blaze/cai sim computations.
+        if self.is_draft_worker:
+            self.moe_gate_correction_bias = None
+            return
+        self.moe_gate_correction_bias = collect_gate_correction_bias_if_needed(
+            model=self.model, model_config=self.model_config
+        )
+
     def init_gate_scores_capturer(self):
         if self.is_draft_worker:
             return
@@ -911,6 +924,7 @@ class ModelRunner:
                 model_config=self.model_config,
                 num_tokens=self.max_total_num_tokens + self.page_size,
                 max_running_requests=self.max_running_requests,
+                correction_bias=self.moe_gate_correction_bias,
                 device=self.device,
             )
         )
@@ -945,6 +959,7 @@ class ModelRunner:
             BlazeRouter.create(
                 model_config=self.model_config,
                 max_running_requests=self.max_running_requests,
+                correction_bias=self.moe_gate_correction_bias,
                 device=self.device,
             )
         )
@@ -968,6 +983,7 @@ class ModelRunner:
             CaiRouter.create(
                 model_config=self.model_config,
                 max_running_requests=self.max_running_requests,
+                correction_bias=self.moe_gate_correction_bias,
                 device=self.device,
             )
         )

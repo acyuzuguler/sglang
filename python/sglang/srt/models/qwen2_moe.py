@@ -61,9 +61,6 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     should_skip_post_experts_all_reduce,
 )
-from sglang.srt.layers.moe.blaze_router import get_global_blaze_router
-from sglang.srt.layers.moe.cai_router import get_global_cai_router
-from sglang.srt.layers.moe.credit_router import get_global_credit_router
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK, TopKOutputChecker
@@ -117,7 +114,7 @@ from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_stream
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
-from sglang.srt.state_capturer.gate_scores import get_global_gate_scores_capturer
+from sglang.srt.layers.moe.router_hook import apply_moe_router_hook
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
@@ -498,29 +495,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
 
-        if (cap := get_global_gate_scores_capturer()) is not None:
-            cap.capture(
-                self.layer_id,
-                torch.softmax(router_logits.float(), dim=-1).to(torch.float16),
-            )
-
-        # Credit, blaze and cai are mutually exclusive (asserted at
-        # startup); all implement the same route() contract.
-        router = get_global_credit_router()
-        if router is None:
-            router = get_global_blaze_router()
-        if router is None:
-            router = get_global_cai_router()
-        if router is not None and forward_batch is not None:
-            topk_output = router.route(
-                layer_id=self.layer_id,
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                forward_batch=forward_batch,
-                vanilla_topk=self.topk,
-            )
-        else:
-            topk_output = self.topk(hidden_states, router_logits)
+        topk_output = self.topk(hidden_states, router_logits)
+        # Gate-score capture + credit/blaze/cai routing override (see router_hook).
+        topk_output = apply_moe_router_hook(
+            layer_id=self.layer_id,
+            router_logits=router_logits,
+            forward_batch=forward_batch,
+            topk_config=self.topk.topk_config,
+            topk_output=topk_output,
+        )
         if self.enable_shared_expert_fusion and TopKOutputChecker.format_is_standard(
             topk_output
         ):

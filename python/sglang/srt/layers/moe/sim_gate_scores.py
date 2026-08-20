@@ -4,11 +4,14 @@
 #
 # File format (produced by eval/sim/run_sim.py, driven by
 # eval/scripts/generate_sim_load.py): a torch.save'd dict
-# {sim_iteration -> [T_s, num_layers, num_experts] fp16 post-softmax gate
-# scores}, one entry per recorded sim iteration, T_s = that iteration's decode
-# batch size. The keys' uniform spacing IS the recording frequency: one sample
-# stands in for that many decode iterations of a request (the sample_period
-# used by the routers' decode-position replay).
+# {sim_iteration -> [T_s, num_layers, num_experts] fp16 UNBIASED
+# post-scoring-func gate scores} (softmax for qwen3.5-moe; sqrt(softplus) for
+# deepseek_v4, whose noaux_tc correction bias is applied by the routers, and
+# whose hash layers [0, num_hash_layers) carry all-zero rows), one entry per
+# recorded sim iteration, T_s = that iteration's decode batch size. The keys'
+# uniform spacing IS the recording frequency: one sample stands in for that
+# many decode iterations of a request (the sample_period used by the routers'
+# decode-position replay).
 
 import torch
 

@@ -3,23 +3,27 @@
 # capacity cap with score-based token drop, plus optional Expanded Drop. Ported
 # from the offline simulator in eval/sim_cai.py (itself verified against the
 # official reference, github.com/CASE-Lab-UMD/Capacity-Aware-MoE). Gated to the
-# qwen3.5-moe model and enabled by SGLANG_CAI_ROUTER; a no-op for every
-# other model / when off.
+# models in router_hook.SUPPORTED_MOE_ROUTER_MODEL_TYPES and enabled by
+# SGLANG_CAI_ROUTER; a no-op for every other model / when off.
 #
 # SIM-THRESHOLD mode (our serving adaptation of the paper's per-batch cap): the
 # competing population is an offline large-cluster simulation
-# (SGLANG_CAI_GATE_SCORES_FILE, a dict {iteration -> [T_s, L, E] post-softmax
-# gate scores} produced by eval/sim/run_sim.py -- see sim_gate_scores.py)
-# instead of the local decode batch.
+# (SGLANG_CAI_GATE_SCORES_FILE, a dict {iteration -> [T_s, L, E] UNBIASED
+# post-scoring-func gate scores} produced by eval/sim/run_sim.py -- see
+# sim_gate_scores.py) instead of the local decode batch.
 # At init, for every sim sample s we compute per-layer per-expert score
 # thresholds:
 #   candidacy: each sim token nominates its top k_all = ceil(k * rounds)
-#     experts (rounds=1 is the paper's Token Drop, rounds>1 its Expanded Drop)
+#     experts (rounds=1 is the paper's Token Drop, rounds>1 its Expanded Drop);
+#     nomination ranks on SELECTION scores (the noaux_tc correction bias added
+#     when the model has one), matching the model's real vanilla ranking
 #   capacity:  C_s = ceil(gamma * k * T_s / E), T_s = sim sample token count
-#   threshold[s, l, e] = the C_s-th highest sim-candidate score in expert e's
-#     column, or -inf when the column has fewer than C_s candidates (open).
+#   threshold[s, l, e] = the C_s-th highest sim-candidate UNBIASED score in
+#     expert e's column, or -inf when the column has fewer than C_s candidates
+#     (open); per-expert thresholds stay in unbiased-score space because the
+#     bias is a per-expert constant that cancels in the column comparison.
 # At decode time a real token's candidate assignment (token, e) survives iff
-# its softmax score is strictly > threshold[s, layer, e] (ties lose), where s
+# its unbiased score is strictly > threshold[s, layer, e] (ties lose), where s
 # advances PER REQUEST with its own decoded-token count:
 #   s = (decode_pos // sample_period) % num_samples
 # with sample_period inferred from the spacing of the recorded iteration ids
@@ -49,24 +53,30 @@
 # are discarded, and nothing is written -- no masking needed.
 #
 # NOTE: RoutedExpertsCapturer / the expert-distribution recorder fire inside
-# vanilla_topk and therefore record PRE-cai ids; the actual post-cai
+# the model's vanilla TopK and therefore record PRE-cai ids; the actual post-cai
 # routing is recorded by CaiCapturer (SGLANG_LOG_CAI_DIR). Do not
 # combine with speculative decoding: the MTP draft model shares the
 # process-global router and would corrupt the per-slot decode positions.
 
 import logging
 import math
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.router_hook import (
+    resolve_moe_router_dims,
+    selection_scores,
+    weights_from_template,
+)
 from sglang.srt.layers.moe.sim_gate_scores import open_sim_gate_scores, validate_sample
-from sglang.srt.layers.moe.topk import TopKOutputChecker
+from sglang.srt.layers.moe.topk import TopKOutputChecker, apply_scoring_func
 from sglang.srt.state_capturer.cai import get_global_cai_capturer
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.layers.moe.topk import TopKConfig, TopKOutput
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
@@ -80,11 +90,15 @@ def _compute_sim_thresholds(
     top_k: int,
     k_all: int,
     gamma: float,
+    correction_bias: Optional[torch.Tensor],
     device: str,
 ) -> tuple[torch.Tensor, int]:
     """([S, L, E] float32 per-sample per-expert survival thresholds (see
     header), sample_period inferred from the recorded iteration ids).
 
+    Sim samples store UNBIASED scores; correction_bias ([L, E] or None) is
+    added only for the candidacy topk (matching the model's real selection
+    ranking) while the kth-value thresholds stay in unbiased-score space.
     One sample is cloned at a time and processed layer-by-layer on the device
     (~25 MB working set) -- see open_sim_gate_scores for the mmap rationale.
     """
@@ -95,6 +109,8 @@ def _compute_sim_thresholds(
         dtype=torch.float32,
         device=device,
     )
+    if correction_bias is not None:
+        correction_bias = correction_bias.to(device=device, dtype=torch.float32)
     for si, key in enumerate(keys):
         sample = data[key]
         validate_sample(
@@ -107,7 +123,12 @@ def _compute_sim_thresholds(
         )
         for layer in range(num_layers):
             scores = sample[:, layer, :].to(device=device, dtype=torch.float32)
-            cand_ids = torch.topk(scores, k=k_all, dim=-1).indices
+            cand_scores = (
+                scores + correction_bias[layer]
+                if correction_bias is not None
+                else scores
+            )
+            cand_ids = torch.topk(cand_scores, k=k_all, dim=-1).indices
             candidates = torch.zeros_like(scores, dtype=torch.bool).scatter(
                 -1, cand_ids, True
             )
@@ -132,6 +153,7 @@ class CaiRouter:
         *,
         model_config: "ModelConfig",
         max_running_requests: int,
+        correction_bias: Optional[torch.Tensor],
         device: str,
     ) -> Optional["CaiRouter"]:
         if not envs.SGLANG_CAI_ROUTER.get():
@@ -141,12 +163,9 @@ class CaiRouter:
                 "SGLANG_CAI_ROUTER is mutually exclusive with "
                 "SGLANG_CREDIT_ROUTER and SGLANG_BLAZE_ROUTER."
             )
-        tc = model_config.hf_text_config
-        if tc.model_type != "qwen3_5_moe_text":
-            raise ValueError(
-                "SGLANG_CAI_ROUTER is set but the model is not qwen3.5-moe; "
-                "cai routing disabled."
-            )
+        dims = resolve_moe_router_dims(
+            model_config=model_config, feature="SGLANG_CAI_ROUTER"
+        )
         gate_scores_file = envs.SGLANG_CAI_GATE_SCORES_FILE.get()
         if not gate_scores_file:
             raise ValueError(
@@ -154,12 +173,13 @@ class CaiRouter:
                 "population that survival thresholds are computed from)."
             )
         router = CaiRouter(
-            num_layers=tc.num_hidden_layers,
-            num_experts=tc.num_experts,
-            top_k=tc.num_experts_per_tok,
+            num_layers=dims.num_layers,
+            num_experts=dims.num_experts,
+            top_k=dims.top_k,
             gamma=envs.SGLANG_CAI_GAMMA.get(),
             rounds=envs.SGLANG_CAI_ROUNDS.get(),
             gate_scores_file=gate_scores_file,
+            correction_bias=correction_bias,
             max_running_requests=max_running_requests,
             device=device,
         )
@@ -168,8 +188,8 @@ class CaiRouter:
             "(candidates per token k_all=%d) mode=sim-threshold num_samples=%d "
             "sample_period=%d (inferred from the recorded iteration ids) "
             "gate_scores_file=%s capped_expert_columns=%.1f%%",
-            tc.num_experts,
-            tc.num_experts_per_tok,
+            dims.num_experts,
+            dims.top_k,
             router.gamma,
             router.rounds,
             router.k_all,
@@ -189,6 +209,7 @@ class CaiRouter:
         gamma: float,
         rounds: int,
         gate_scores_file: str,
+        correction_bias: Optional[torch.Tensor],
         max_running_requests: int,
         device: str,
     ):
@@ -214,6 +235,7 @@ class CaiRouter:
             top_k=top_k,
             k_all=self.k_all,
             gamma=gamma,
+            correction_bias=correction_bias,
             device=device,
         )
         # Python ints so the modulo/div in the decode path are graph-safe
@@ -242,14 +264,15 @@ class CaiRouter:
         self,
         *,
         layer_id: int,
-        hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         forward_batch: "ForwardBatch",
-        vanilla_topk: Callable,
+        template: "TopKOutput",
+        topk_config: "TopKConfig",
     ):
-        # Always compute the vanilla output: it fixes the correct output format/dtypes
-        # for the downstream expert kernels, and is the prefill / fallback path.
-        topk_output = vanilla_topk(hidden_states, router_logits)
+        # The caller passes the vanilla topk output in as template: it fixes the
+        # correct output format/dtypes for the downstream expert kernels, and is
+        # the prefill / fallback path.
+        topk_output = template
         if not forward_batch.forward_mode.is_decode():
             # Prefill/extend routes vanilla by design (counter reset happens in
             # on_forward_end).
@@ -265,15 +288,23 @@ class CaiRouter:
                 f"got {router_logits.shape[0]} rows for "
                 f"{forward_batch.req_pool_indices.shape[0]} requests."
             )
-        return self._route_decode(layer_id, router_logits, forward_batch, topk_output)
+        return self._route_decode(
+            layer_id, router_logits, forward_batch, topk_output, topk_config
+        )
 
-    def _route_decode(self, layer_id, router_logits, forward_batch, template):
+    def _route_decode(
+        self, layer_id, router_logits, forward_batch, template, topk_config
+    ):
         B = router_logits.shape[0]
-        scores = torch.softmax(router_logits.float(), dim=-1)  # [B, E]
+        scores = apply_scoring_func(router_logits.float(), topk_config.scoring_func)
+        # Selection scores rank candidacy and the final pick (adds the noaux_tc
+        # correction bias when the model has one); survival and weights stay in
+        # unbiased-score space (see header).
+        sel = selection_scores(scores=scores, topk_config=topk_config)  # [B, E]
 
         # Candidates: each row nominates its top k_all experts (mirrors
         # eval/sim_cai.py).
-        cand_ids = torch.topk(scores, k=self.k_all, dim=-1).indices  # [B, k_all]
+        cand_ids = torch.topk(sel, k=self.k_all, dim=-1).indices  # [B, k_all]
         candidates = torch.zeros_like(scores, dtype=torch.bool).scatter(
             -1, cand_ids, True
         )
@@ -287,16 +318,20 @@ class CaiRouter:
         s = (self._decode_pos[idx] // self.sample_period) % self.num_samples  # [B]
         keep = candidates & (scores > self.thresholds[s, layer_id])
 
-        # Final per-token selection over the survivors; slots with no survivor are
-        # dropped: weight 0, and the (arbitrary but valid) topk index stays in place
-        # for the expert kernels. Weights renormalize the ORIGINAL scores of the
-        # surviving set; an all-dropped row gets all-zero weights (residual only).
+        # Final per-token selection over the survivors (ranked on selection
+        # scores); slots with no survivor are dropped: weight 0, and the
+        # (arbitrary but valid) topk index stays in place for the expert kernels.
+        # Weights renormalize the ORIGINAL, unbiased scores of the surviving set,
+        # scaled to the vanilla row convention; an all-dropped row gets all-zero
+        # weights (residual only).
         surviving, ids = torch.topk(
-            scores.masked_fill(~keep, -torch.inf), k=self.top_k, dim=-1
+            sel.masked_fill(~keep, -torch.inf), k=self.top_k, dim=-1
         )  # [B, k]
         dropped = ~torch.isfinite(surviving)  # [B, k]
         topk_scores = scores.gather(-1, ids).masked_fill(dropped, 0.0)
-        weights = topk_scores / topk_scores.sum(dim=-1, keepdim=True).clamp_min(1e-20)
+        weights = weights_from_template(
+            gathered_scores=topk_scores, template=template, topk_config=topk_config
+        )
 
         cap = get_global_cai_capturer()
         if cap is not None:

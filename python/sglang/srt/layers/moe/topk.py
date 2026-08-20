@@ -657,6 +657,19 @@ class TopK(MultiPlatformOp):
 # ------------------------------- TopK implementation -------------------------------------
 
 
+def apply_scoring_func(
+    gating_output: torch.Tensor, scoring_func: str
+) -> torch.Tensor:
+    if scoring_func == "softmax":
+        return gating_output.softmax(dim=-1)
+    elif scoring_func == "sigmoid":
+        return gating_output.sigmoid()
+    elif scoring_func == "sqrtsoftplus":
+        return F.softplus(gating_output).sqrt()
+    else:
+        raise ValueError(f"Invalid scoring function: {scoring_func}")
+
+
 def fused_topk_torch_native(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -666,14 +679,7 @@ def fused_topk_torch_native(
     scoring_func: str = "softmax",
 ):
     def scoring_func_impl(gating_output: torch.Tensor) -> torch.Tensor:
-        if scoring_func == "softmax":
-            return gating_output.softmax(dim=-1)
-        elif scoring_func == "sigmoid":
-            return gating_output.sigmoid()
-        elif scoring_func == "sqrtsoftplus":
-            return F.softplus(gating_output).sqrt()
-        else:
-            raise ValueError(f"Invalid scoring function: {scoring_func}")
+        return apply_scoring_func(gating_output, scoring_func)
 
     if correction_bias is not None:
         n_routed_experts = gating_output.shape[-1]

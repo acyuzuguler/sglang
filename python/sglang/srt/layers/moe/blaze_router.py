@@ -4,23 +4,28 @@
 # per-sample load profiles inferred from an offline large-cluster simulation
 # (SGLANG_BLAZE_GATE_SCORES_FILE, the same dump the CAI router consumes: a dict
 # {iteration -> [T_s, L, E] post-softmax gate scores} produced by eval/sim/run_sim.py
-# -- see sim_gate_scores.py). At init every sim sample is reduced to its vanilla
-# top-k selection counts per (layer, expert), normalized to per-layer mean 1 (Eq. 5).
+# -- see sim_gate_scores.py; samples always store UNBIASED post-scoring-func
+# scores). At init every sim sample is reduced to its vanilla top-k selection
+# counts per (layer, expert) -- adding the noaux_tc correction bias for the
+# selection when the model has one -- normalized to per-layer mean 1 (Eq. 5).
 # At decode time a request is penalized with the sim sample matching its own
 # decoded-token count:
 #   sample = (decode_pos // sample_period) % num_samples
 # with sample_period inferred from the spacing of the recorded iteration ids (first
-# decoded token -> sample 0; wraps past the last sample). Gated to the qwen3.5-moe
-# model and enabled by SGLANG_BLAZE_ROUTER; a no-op for every other model / when off.
+# decoded token -> sample 0; wraps past the last sample). Gated to the models in
+# router_hook.SUPPORTED_MOE_ROUTER_MODEL_TYPES and enabled by SGLANG_BLAZE_ROUTER;
+# a no-op for every other model / when off.
 #
 # Per token and layer: r = s - alpha * load picks the experts (Eq. 2), an affinity
 # guardrail pins the original top-1 where the top1-top2 gap exceeds tau (Eq. 7), and
-# the mixture weights always come from the unpenalized scores of the selected set
-# (Eq. 4). The simulator runs on s = log(softmax(logits)); raw router logits differ
-# from that by the per-token constant logsumexp, which cancels in rankings, gaps,
-# and the selected-set softmax, so the same alpha/tau transfer unchanged. alpha is
-# SGLANG_BLAZE_ALPHA, fixed for the whole run (the paper's two-tier safety monitor
-# that adapts alpha was removed; every experiment ran the "fixed" policy).
+# the mixture weights always come from the unpenalized, unbiased scores of the
+# selected set (Eq. 4). The penalized ranking runs on s = log(selection scores):
+# for softmax models that equals raw logits minus the per-token logsumexp constant,
+# which cancels in rankings, gaps, and the selected-set renormalization, so
+# alpha/tau keep their original qwen semantics exactly; for other scoring funcs it
+# keeps the penalty scale-free in the same way. alpha is SGLANG_BLAZE_ALPHA, fixed
+# for the whole run (the paper's two-tier safety monitor that adapts alpha was
+# removed; every experiment ran the "fixed" policy).
 #
 # Decode-only (prefill routes vanilla). The per-slot decode-position counter is
 # maintained eagerly in on_forward_end (called with the real, un-padded forward_batch
@@ -33,24 +38,30 @@
 # nothing is written.
 #
 # NOTE: RoutedExpertsCapturer / the expert-distribution recorder fire inside
-# vanilla_topk and therefore record PRE-blaze ids; the actual post-blaze routing is
+# the model's vanilla TopK and therefore record PRE-blaze ids; the actual post-blaze routing is
 # recorded by BlazeCapturer (SGLANG_LOG_BLAZE_DIR). Do not combine with speculative
 # decoding: the MTP draft model shares the process-global router and would corrupt
 # the per-slot decode positions.
 
 import logging
 from collections import Counter
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.router_hook import (
+    resolve_moe_router_dims,
+    selection_scores,
+    weights_from_template,
+)
 from sglang.srt.layers.moe.sim_gate_scores import open_sim_gate_scores, validate_sample
-from sglang.srt.layers.moe.topk import TopKOutputChecker
+from sglang.srt.layers.moe.topk import TopKOutputChecker, apply_scoring_func
 from sglang.srt.state_capturer.blaze import get_global_blaze_capturer
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.layers.moe.topk import TopKConfig, TopKOutput
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
@@ -62,6 +73,7 @@ def _compute_sim_loads(
     num_layers: int,
     num_experts: int,
     top_k: int,
+    correction_bias: Optional[torch.Tensor],
     device: str,
 ) -> tuple[torch.Tensor, int]:
     """([S, L, E] float32 per-sample normalized load profiles (see header),
@@ -69,14 +81,18 @@ def _compute_sim_loads(
 
     Every sample is reduced to its vanilla top-k selection counts per (layer,
     expert) and normalized to per-layer mean 1 (Eq. 5), so the sim batch sizes
-    cancel and only the shape of each load distribution matters. One sample is
-    cloned at a time and processed layer-by-layer on the device (~25 MB working
-    set) -- see open_sim_gate_scores for the mmap rationale.
+    cancel and only the shape of each load distribution matters. Sim samples
+    store UNBIASED scores; correction_bias ([L, E] or None) is added before the
+    selection topk so noaux_tc models reproduce their real vanilla selection.
+    One sample is cloned at a time and processed layer-by-layer on the device
+    (~25 MB working set) -- see open_sim_gate_scores for the mmap rationale.
     """
     data, keys, sample_period = open_sim_gate_scores(path=path)
     loads = torch.empty(
         (len(keys), num_layers, num_experts), dtype=torch.float32, device=device
     )
+    if correction_bias is not None:
+        correction_bias = correction_bias.to(device=device, dtype=torch.float32)
     for si, key in enumerate(keys):
         sample = data[key]
         validate_sample(
@@ -87,6 +103,8 @@ def _compute_sim_loads(
         sample = sample.clone()  # one sequential read of the mmap'd sample
         for layer in range(num_layers):
             scores = sample[:, layer, :].to(device=device, dtype=torch.float32)
+            if correction_bias is not None:
+                scores = scores + correction_bias[layer]
             ids = torch.topk(scores, k=top_k, dim=-1).indices  # [T, k]
             loads[si, layer] = torch.bincount(
                 ids.flatten(), minlength=num_experts
@@ -109,6 +127,7 @@ class BlazeRouter:
         *,
         model_config: "ModelConfig",
         max_running_requests: int,
+        correction_bias: Optional[torch.Tensor],
         device: str,
     ) -> Optional["BlazeRouter"]:
         if not envs.SGLANG_BLAZE_ROUTER.get():
@@ -118,12 +137,9 @@ class BlazeRouter:
                 "SGLANG_BLAZE_ROUTER is mutually exclusive with "
                 "SGLANG_CREDIT_ROUTER and SGLANG_CAI_ROUTER."
             )
-        tc = model_config.hf_text_config
-        if tc.model_type != "qwen3_5_moe_text":
-            raise ValueError(
-                "SGLANG_BLAZE_ROUTER is set but the model is not qwen3_5_moe; "
-                "blaze routing disabled."
-            )
+        dims = resolve_moe_router_dims(
+            model_config=model_config, feature="SGLANG_BLAZE_ROUTER"
+        )
         gate_scores_file = envs.SGLANG_BLAZE_GATE_SCORES_FILE.get()
         if not gate_scores_file:
             raise ValueError(
@@ -132,11 +148,12 @@ class BlazeRouter:
             )
         router = BlazeRouter(
             gate_scores_file=gate_scores_file,
-            num_layers=tc.num_hidden_layers,
-            num_experts=tc.num_experts,
-            top_k=tc.num_experts_per_tok,
+            num_layers=dims.num_layers,
+            num_experts=dims.num_experts,
+            top_k=dims.top_k,
             alpha=envs.SGLANG_BLAZE_ALPHA.get(),
             tau=envs.SGLANG_BLAZE_TAU.get(),
+            correction_bias=correction_bias,
             max_running_requests=max_running_requests,
             device=device,
         )
@@ -144,9 +161,9 @@ class BlazeRouter:
             "BlazeRouter enabled: layers=%d experts=%d k=%d alpha=%.4f tau=%.4f "
             "num_samples=%d sample_period=%d (inferred from the recorded "
             "iteration ids) gate_scores_file=%s norm_load[max=%.2f]",
-            tc.num_hidden_layers,
-            tc.num_experts,
-            tc.num_experts_per_tok,
+            dims.num_layers,
+            dims.num_experts,
+            dims.top_k,
             router.alpha,
             router.tau,
             router.num_samples,
@@ -165,6 +182,7 @@ class BlazeRouter:
         top_k: int,
         alpha: float,
         tau: float,
+        correction_bias: Optional[torch.Tensor],
         max_running_requests: int,
         device: str,
     ):
@@ -180,6 +198,7 @@ class BlazeRouter:
             num_layers=num_layers,
             num_experts=num_experts,
             top_k=top_k,
+            correction_bias=correction_bias,
             device=device,
         )
         # Python ints so the modulo/div in the decode path are graph-safe
@@ -213,14 +232,15 @@ class BlazeRouter:
         self,
         *,
         layer_id: int,
-        hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         forward_batch: "ForwardBatch",
-        vanilla_topk: Callable,
+        template: "TopKOutput",
+        topk_config: "TopKConfig",
     ):
-        # Always compute the vanilla output: it fixes the correct output format/dtypes
-        # for the downstream expert kernels, and is the prefill / fallback path.
-        topk_output = vanilla_topk(hidden_states, router_logits)
+        # The caller passes the vanilla topk output in as template: it fixes the
+        # correct output format/dtypes for the downstream expert kernels, and is
+        # the prefill / fallback path.
+        topk_output = template
         if not forward_batch.forward_mode.is_decode():
             # Prefill/extend routes vanilla by design (counter reset happens in
             # on_forward_end).
@@ -234,10 +254,19 @@ class BlazeRouter:
                 f"got {router_logits.shape[0]} rows for "
                 f"{forward_batch.req_pool_indices.shape[0]} requests."
             )
-        return self._route_decode(layer_id, router_logits, forward_batch, topk_output)
+        return self._route_decode(
+            layer_id, router_logits, forward_batch, topk_output, topk_config
+        )
 
-    def _route_decode(self, layer_id, router_logits, forward_batch, template):
-        s = router_logits.float()  # [B, E]
+    def _route_decode(
+        self, layer_id, router_logits, forward_batch, template, topk_config
+    ):
+        scores = apply_scoring_func(router_logits.float(), topk_config.scoring_func)
+        # Penalized ranking runs on log selection scores (see header: for softmax
+        # models this is raw logits minus a per-token constant, so qwen semantics
+        # are unchanged). The clamp keeps dead experts finite.
+        sel = selection_scores(scores=scores, topk_config=topk_config)  # [B, E]
+        s = sel.clamp_min(1e-9).log()  # [B, E]
         # Load-penalized scores (Eq. 2): each request is penalized with the sim
         # sample matching its own decode position (see header). Padded graph rows
         # read pool slot 0's counter, their outputs are discarded, and nothing is
@@ -256,9 +285,14 @@ class BlazeRouter:
         r = r.scatter(1, top1_ids, r_top1)
 
         ids = torch.topk(r, self.top_k, dim=-1).indices  # [B, k], penalized order
-        # Mixture weights from the ORIGINAL scores of the selected set (Eq. 4):
-        # softmax over the gathered logits == the model's renormalized topk probs.
-        weights = torch.softmax(s.gather(1, ids), dim=-1)  # [B, k] fp32
+        # Mixture weights from the ORIGINAL, unbiased scores of the selected set
+        # (Eq. 4), scaled to the vanilla row convention (for softmax models this
+        # equals the old softmax-over-gathered-logits exactly).
+        weights = weights_from_template(
+            gathered_scores=scores.gather(1, ids),
+            template=template,
+            topk_config=topk_config,
+        )  # [B, k] fp32
 
         cap = get_global_blaze_capturer()
         if cap is not None:
