@@ -675,25 +675,29 @@ class Envs:
     # Per-request dump of post-credit expert ids + selected-expert credits.
     SGLANG_LOG_CREDIT_DIR = EnvStr(None)
 
+    # Offline cluster-sim gate-scores dump shared by the sim-replay MoE routers
+    # below (required by both SGLANG_BLAZE_ROUTER and SGLANG_CAI_ROUTER, which
+    # are mutually exclusive): a directory of per-iteration *_{iteration}.pt
+    # files, each {iteration -> [T_s, L, E] UNBIASED post-scoring-func gate
+    # scores}, from eval/sim/run_sim.py. Each sample stands in for `period`
+    # decode iterations of a request, with the period inferred from the spacing
+    # of the iteration ids in the filenames:
+    # sample = (decode_pos // period) % num_samples (wraps past the last).
+    SGLANG_SIM_GATE_SCORES_DIR = EnvStr(None)
+
     # BLAZE MoE routing (sim-load-penalized top-k, MLSys'26; supported MoE
     # models only -- see layers/moe/router_hook.py).
     # The paper's online EMA load tracker is replaced by per-sample load
-    # profiles inferred from an offline cluster simulation, replayed per
-    # request by decode position (same mechanism and same file as
-    # SGLANG_CAI_GATE_SCORES_FILE).
+    # profiles from SGLANG_SIM_GATE_SCORES_DIR, replayed per request by decode
+    # position: at init, every sample is reduced to its vanilla top-k selection
+    # counts per (layer, expert), normalized to per-layer mean 1; the decode
+    # bias penalizes each request with the sample matching its own
+    # decoded-token count.
     SGLANG_BLAZE_ROUTER = EnvBool(False)
     # Bias strength, fixed for the whole run (the paper's safety monitor that
     # adapts alpha is not implemented).
     SGLANG_BLAZE_ALPHA = EnvFloat(0.5)
     SGLANG_BLAZE_TAU = EnvFloat(1.5)
-    # Required with SGLANG_BLAZE_ROUTER: .pt dict {iteration -> [T_s, L, E]
-    # UNBIASED post-scoring-func gate scores} from eval/sim/run_sim.py. At init, every sample
-    # is reduced to its vanilla top-k selection counts per (layer, expert),
-    # normalized to per-layer mean 1; the decode bias penalizes each request
-    # with the sample matching its own decoded-token count:
-    # sample = (decode_pos // period) % num_samples, with the period inferred
-    # from the spacing of the recorded iteration ids (wraps past the last).
-    SGLANG_BLAZE_GATE_SCORES_FILE = EnvStr(None)
     SGLANG_BLAZE_DEBUG = EnvBool(False)
     # Per-request dump of post-blaze expert ids.
     SGLANG_LOG_BLAZE_DIR = EnvStr(None)
@@ -702,7 +706,11 @@ class Envs:
     # score-based token drop / expanded drop (ICLR'26; supported MoE models
     # only -- see layers/moe/router_hook.py).
     # SIM-THRESHOLD mode (our serving adaptation): the competing population is
-    # an offline cluster simulation instead of the local decode batch.
+    # SGLANG_SIM_GATE_SCORES_DIR instead of the local decode batch. At init,
+    # per-sample per-expert score thresholds are computed (the C_s-th highest
+    # sim-candidate score, -inf if the expert has fewer than C_s candidates);
+    # a real decode assignment survives iff its score is strictly above the
+    # threshold of the sample matching the request's decoded-token count.
     SGLANG_CAI_ROUTER = EnvBool(False)
     # Capacity factor gamma: per-expert cap C_s = ceil(gamma * top_k * T_s / E)
     # where T_s is the sim sample's token count.
@@ -710,15 +718,6 @@ class Envs:
     # Candidate overselect multiplier: each token nominates ceil(top_k * rounds)
     # candidate experts before the cap; 1 = pure Token Drop, >1 = Expanded Drop.
     SGLANG_CAI_ROUNDS = EnvInt(1)
-    # Required with SGLANG_CAI_ROUTER: .pt dict {iteration -> [T_s, L, E]
-    # UNBIASED post-scoring-func gate scores} from eval/sim/run_sim.py. At init, per-sample
-    # per-expert score thresholds are computed (the C_s-th highest sim-candidate
-    # score, -inf if the expert has fewer than C_s candidates); a real decode
-    # assignment survives iff its score is strictly above the threshold. Each
-    # sample stands in for `period` decode iterations of a request, where the
-    # period is inferred from the spacing of the recorded iteration ids:
-    # sample = (decode_pos // period) % num_samples (wraps past the last).
-    SGLANG_CAI_GATE_SCORES_FILE = EnvStr(None)
     SGLANG_CAI_DEBUG = EnvBool(False)
     # Per-request dump of post-cai expert ids (-1 = dropped slot) + weights.
     SGLANG_LOG_CAI_DIR = EnvStr(None)

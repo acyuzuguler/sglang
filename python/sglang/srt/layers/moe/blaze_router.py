@@ -2,8 +2,9 @@
 # Routing", MLSys'26): top-k over load-penalized routing scores. Ported from the
 # offline simulator in eval/sim_blaze.py, with the online EMA load tracker replaced by
 # per-sample load profiles inferred from an offline large-cluster simulation
-# (SGLANG_BLAZE_GATE_SCORES_FILE, the same dump the CAI router consumes: a dict
-# {iteration -> [T_s, L, E] post-softmax gate scores} produced by eval/sim/run_sim.py
+# (SGLANG_SIM_GATE_SCORES_DIR, the same dump the CAI router consumes: a
+# directory of per-iteration *_{iteration}.pt files, each holding {iteration ->
+# [T_s, L, E] post-softmax gate scores}, produced by eval/sim/run_sim.py
 # -- see sim_gate_scores.py; samples always store UNBIASED post-scoring-func
 # scores). At init every sim sample is reduced to its vanilla top-k selection
 # counts per (layer, expert) -- adding the noaux_tc correction bias for the
@@ -55,7 +56,11 @@ from sglang.srt.layers.moe.router_hook import (
     selection_scores,
     weights_from_template,
 )
-from sglang.srt.layers.moe.sim_gate_scores import open_sim_gate_scores, validate_sample
+from sglang.srt.layers.moe.sim_gate_scores import (
+    load_sim_gate_scores_sample,
+    scan_sim_gate_scores,
+    validate_sample,
+)
 from sglang.srt.layers.moe.topk import TopKOutputChecker, apply_scoring_func
 from sglang.srt.state_capturer.blaze import get_global_blaze_capturer
 
@@ -84,17 +89,18 @@ def _compute_sim_loads(
     cancel and only the shape of each load distribution matters. Sim samples
     store UNBIASED scores; correction_bias ([L, E] or None) is added before the
     selection topk so noaux_tc models reproduce their real vanilla selection.
-    One sample is cloned at a time and processed layer-by-layer on the device
-    (~25 MB working set) -- see open_sim_gate_scores for the mmap rationale.
+    One sample file is loaded at a time and processed layer-by-layer on the
+    device (~25 MB working set) -- see load_sim_gate_scores_sample for the
+    mmap rationale.
     """
-    data, keys, sample_period = open_sim_gate_scores(path=path)
+    entries, sample_period = scan_sim_gate_scores(path=path)
     loads = torch.empty(
-        (len(keys), num_layers, num_experts), dtype=torch.float32, device=device
+        (len(entries), num_layers, num_experts), dtype=torch.float32, device=device
     )
     if correction_bias is not None:
         correction_bias = correction_bias.to(device=device, dtype=torch.float32)
-    for si, key in enumerate(keys):
-        sample = data[key]
+    for si, (key, sample_file) in enumerate(entries):
+        sample = load_sim_gate_scores_sample(file_path=sample_file, iteration=key)
         validate_sample(
             key=key, sample=sample, num_layers=num_layers, num_experts=num_experts
         )
@@ -112,7 +118,7 @@ def _compute_sim_loads(
         logger.info(
             "BlazeRouter: sim loads %d/%d (iteration %s, T=%d)",
             si + 1,
-            len(keys),
+            len(entries),
             key,
             sample.shape[0],
         )
@@ -140,14 +146,14 @@ class BlazeRouter:
         dims = resolve_moe_router_dims(
             model_config=model_config, feature="SGLANG_BLAZE_ROUTER"
         )
-        gate_scores_file = envs.SGLANG_BLAZE_GATE_SCORES_FILE.get()
-        if not gate_scores_file:
+        gate_scores_dir = envs.SGLANG_SIM_GATE_SCORES_DIR.get()
+        if not gate_scores_dir:
             raise ValueError(
-                "SGLANG_BLAZE_ROUTER needs SGLANG_BLAZE_GATE_SCORES_FILE (the sim "
+                "SGLANG_BLAZE_ROUTER needs SGLANG_SIM_GATE_SCORES_DIR (the sim "
                 "population that per-sample load profiles are computed from)."
             )
         router = BlazeRouter(
-            gate_scores_file=gate_scores_file,
+            gate_scores_dir=gate_scores_dir,
             num_layers=dims.num_layers,
             num_experts=dims.num_experts,
             top_k=dims.top_k,
@@ -160,7 +166,7 @@ class BlazeRouter:
         logger.info(
             "BlazeRouter enabled: layers=%d experts=%d k=%d alpha=%.4f tau=%.4f "
             "num_samples=%d sample_period=%d (inferred from the recorded "
-            "iteration ids) gate_scores_file=%s norm_load[max=%.2f]",
+            "iteration ids) gate_scores_dir=%s norm_load[max=%.2f]",
             dims.num_layers,
             dims.num_experts,
             dims.top_k,
@@ -168,7 +174,7 @@ class BlazeRouter:
             router.tau,
             router.num_samples,
             router.sample_period,
-            gate_scores_file,
+            gate_scores_dir,
             router.load.max().item(),
         )
         return router
@@ -176,7 +182,7 @@ class BlazeRouter:
     def __init__(
         self,
         *,
-        gate_scores_file: str,
+        gate_scores_dir: str,
         num_layers: int,
         num_experts: int,
         top_k: int,
@@ -194,7 +200,7 @@ class BlazeRouter:
         # [S, L, E] per-sample normalized loads from the sim population (see
         # header); the sample period is inferred from the recorded iteration ids.
         self.load, sample_period = _compute_sim_loads(
-            path=gate_scores_file,
+            path=gate_scores_dir,
             num_layers=num_layers,
             num_experts=num_experts,
             top_k=top_k,

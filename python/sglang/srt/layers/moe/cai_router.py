@@ -8,9 +8,10 @@
 #
 # SIM-THRESHOLD mode (our serving adaptation of the paper's per-batch cap): the
 # competing population is an offline large-cluster simulation
-# (SGLANG_CAI_GATE_SCORES_FILE, a dict {iteration -> [T_s, L, E] UNBIASED
-# post-scoring-func gate scores} produced by eval/sim/run_sim.py -- see
-# sim_gate_scores.py) instead of the local decode batch.
+# (SGLANG_SIM_GATE_SCORES_DIR, a directory of per-iteration *_{iteration}.pt
+# files, each holding {iteration -> [T_s, L, E] UNBIASED post-scoring-func
+# gate scores}, produced by eval/sim/run_sim.py -- see sim_gate_scores.py)
+# instead of the local decode batch.
 # At init, for every sim sample s we compute per-layer per-expert score
 # thresholds:
 #   candidacy: each sim token nominates its top k_all = ceil(k * rounds)
@@ -70,7 +71,11 @@ from sglang.srt.layers.moe.router_hook import (
     selection_scores,
     weights_from_template,
 )
-from sglang.srt.layers.moe.sim_gate_scores import open_sim_gate_scores, validate_sample
+from sglang.srt.layers.moe.sim_gate_scores import (
+    load_sim_gate_scores_sample,
+    scan_sim_gate_scores,
+    validate_sample,
+)
 from sglang.srt.layers.moe.topk import TopKOutputChecker, apply_scoring_func
 from sglang.srt.state_capturer.cai import get_global_cai_capturer
 
@@ -99,20 +104,21 @@ def _compute_sim_thresholds(
     Sim samples store UNBIASED scores; correction_bias ([L, E] or None) is
     added only for the candidacy topk (matching the model's real selection
     ranking) while the kth-value thresholds stay in unbiased-score space.
-    One sample is cloned at a time and processed layer-by-layer on the device
-    (~25 MB working set) -- see open_sim_gate_scores for the mmap rationale.
+    One sample file is loaded at a time and processed layer-by-layer on the
+    device (~25 MB working set) -- see load_sim_gate_scores_sample for the
+    mmap rationale.
     """
-    data, keys, sample_period = open_sim_gate_scores(path=path)
+    entries, sample_period = scan_sim_gate_scores(path=path)
     thresholds = torch.full(
-        (len(keys), num_layers, num_experts),
+        (len(entries), num_layers, num_experts),
         -torch.inf,
         dtype=torch.float32,
         device=device,
     )
     if correction_bias is not None:
         correction_bias = correction_bias.to(device=device, dtype=torch.float32)
-    for si, key in enumerate(keys):
-        sample = data[key]
+    for si, (key, sample_file) in enumerate(entries):
+        sample = load_sim_gate_scores_sample(file_path=sample_file, iteration=key)
         validate_sample(
             key=key, sample=sample, num_layers=num_layers, num_experts=num_experts
         )
@@ -139,7 +145,7 @@ def _compute_sim_thresholds(
         logger.info(
             "CaiRouter: sim thresholds %d/%d (iteration %s, T=%d, C=%d)",
             si + 1,
-            len(keys),
+            len(entries),
             key,
             num_tokens,
             capacity,
@@ -166,10 +172,10 @@ class CaiRouter:
         dims = resolve_moe_router_dims(
             model_config=model_config, feature="SGLANG_CAI_ROUTER"
         )
-        gate_scores_file = envs.SGLANG_CAI_GATE_SCORES_FILE.get()
-        if not gate_scores_file:
+        gate_scores_dir = envs.SGLANG_SIM_GATE_SCORES_DIR.get()
+        if not gate_scores_dir:
             raise ValueError(
-                "SGLANG_CAI_ROUTER needs SGLANG_CAI_GATE_SCORES_FILE (the sim "
+                "SGLANG_CAI_ROUTER needs SGLANG_SIM_GATE_SCORES_DIR (the sim "
                 "population that survival thresholds are computed from)."
             )
         router = CaiRouter(
@@ -178,7 +184,7 @@ class CaiRouter:
             top_k=dims.top_k,
             gamma=envs.SGLANG_CAI_GAMMA.get(),
             rounds=envs.SGLANG_CAI_ROUNDS.get(),
-            gate_scores_file=gate_scores_file,
+            gate_scores_dir=gate_scores_dir,
             correction_bias=correction_bias,
             max_running_requests=max_running_requests,
             device=device,
@@ -187,7 +193,7 @@ class CaiRouter:
             "CaiRouter enabled: experts=%d k=%d gamma=%.4f rounds=%d "
             "(candidates per token k_all=%d) mode=sim-threshold num_samples=%d "
             "sample_period=%d (inferred from the recorded iteration ids) "
-            "gate_scores_file=%s capped_expert_columns=%.1f%%",
+            "gate_scores_dir=%s capped_expert_columns=%.1f%%",
             dims.num_experts,
             dims.top_k,
             router.gamma,
@@ -195,7 +201,7 @@ class CaiRouter:
             router.k_all,
             router.num_samples,
             router.sample_period,
-            gate_scores_file,
+            gate_scores_dir,
             (100 * router.thresholds.isfinite().float().mean()).item(),
         )
         return router
@@ -208,7 +214,7 @@ class CaiRouter:
         top_k: int,
         gamma: float,
         rounds: int,
-        gate_scores_file: str,
+        gate_scores_dir: str,
         correction_bias: Optional[torch.Tensor],
         max_running_requests: int,
         device: str,
@@ -229,7 +235,7 @@ class CaiRouter:
         # [S, L, E] survival thresholds from the sim population (see header);
         # the sample period is inferred from the recorded iteration ids.
         self.thresholds, sample_period = _compute_sim_thresholds(
-            path=gate_scores_file,
+            path=gate_scores_dir,
             num_layers=num_layers,
             num_experts=num_experts,
             top_k=top_k,
