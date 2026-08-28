@@ -667,15 +667,23 @@ class Envs:
     # Credit-based MoE routing (per-request load balancing; supported MoE models
     # only -- see layers/moe/router_hook.py)
     SGLANG_CREDIT_ROUTER = EnvBool(False)
-    # Initial / maximum credit balance per (layer, expert), separately per phase.
+    # Initial / maximum credit balance per (layer, expert), separately per phase. In decode
+    # MAX_CRED is also the gain scale of the debt threshold (KAPPA / MAX_CRED per credit of debt).
     SGLANG_CREDIT_DECODE_MAX_CRED = EnvInt(240)
     SGLANG_CREDIT_PREFILL_MAX_CRED = EnvInt(240)
     # Credits spent per selected expert, separately for the decode phase (per-token
-    # rule inside the CUDA graph) and the prefill phase (per-chunk bulk rule).
-    SGLANG_CREDIT_DECODE_COST = EnvInt(4)
+    # rule inside the CUDA graph) and the prefill phase (per-chunk bulk rule). An expert
+    # keeps about 1/COST picks per token of a request.
+    SGLANG_CREDIT_DECODE_COST = EnvInt(8)
     SGLANG_CREDIT_PREFILL_COST = EnvInt(4)
-    # Decode soft-bias strength: topk(scores + beta * creds/creds_rowmax * scores_rowmax)
-    SGLANG_CREDIT_DECODE_BETA = EnvFloat(0.8)
+    # Decode: debt-driven score threshold (credit_router.py header). RHO: an expert in the
+    # token's vanilla top-k regenerates (1-RHO) + RHO*COST credits instead of 1 (keeps the
+    # request's hot experts ordered by demand); KAPPA: threshold at credit 0 in units of the
+    # token's top score, thr = KAPPA * s_max * (1 - cred/MAX_CRED)^+; PROTECT: fraction of
+    # tokens per request/layer whose top-1 expert is always kept (running w1 quantile, 0 = off).
+    SGLANG_CREDIT_DECODE_RHO = EnvFloat(0.2)
+    SGLANG_CREDIT_DECODE_KAPPA = EnvFloat(1.0)
+    SGLANG_CREDIT_DECODE_PROTECT = EnvFloat(0.5)
     # Prefill is a hard per-request token budget (an expert serves at most
     # (T + PREFILL_MAX_CRED) // PREFILL_COST of a request's chunk tokens); PROTECT is the
     # fraction of tokens per request/layer whose top-1 expert is always kept (sim protect_p).
