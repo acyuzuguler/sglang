@@ -667,32 +667,47 @@ class Envs:
     # Credit-based MoE routing (per-request load balancing; supported MoE models
     # only -- see layers/moe/router_hook.py)
     SGLANG_CREDIT_ROUTER = EnvBool(False)
-    SGLANG_CREDIT_MAX_CRED = EnvInt(240)
-    SGLANG_CREDIT_COST = EnvInt(4)
-    # Soft-bias strength: topk(scores + beta * creds/creds_rowmax * scores_rowmax)
-    SGLANG_CREDIT_BETA = EnvFloat(0.8)
+    # Initial / maximum credit balance per (layer, expert), separately per phase.
+    SGLANG_CREDIT_DECODE_MAX_CRED = EnvInt(240)
+    SGLANG_CREDIT_PREFILL_MAX_CRED = EnvInt(240)
+    # Credits spent per selected expert, separately for the decode phase (per-token
+    # rule inside the CUDA graph) and the prefill phase (per-chunk bulk rule).
+    SGLANG_CREDIT_DECODE_COST = EnvInt(4)
+    SGLANG_CREDIT_PREFILL_COST = EnvInt(4)
+    # Decode soft-bias strength: topk(scores + beta * creds/creds_rowmax * scores_rowmax)
+    SGLANG_CREDIT_DECODE_BETA = EnvFloat(0.8)
+    # Prefill is a hard per-request token budget (an expert serves at most
+    # (T + PREFILL_MAX_CRED) // PREFILL_COST of a request's chunk tokens); PROTECT is the
+    # fraction of tokens per request/layer whose top-1 expert is always kept (sim protect_p).
+    SGLANG_CREDIT_PREFILL_PROTECT = EnvFloat(1.0)
     SGLANG_CREDIT_DEBUG = EnvBool(False)
     # Per-request dump of post-credit expert ids + selected-expert credits.
     SGLANG_LOG_CREDIT_DIR = EnvStr(None)
 
     # Offline cluster-sim gate-scores dump shared by the sim-replay MoE routers
     # below (required by both SGLANG_BLAZE_ROUTER and SGLANG_CAI_ROUTER, which
-    # are mutually exclusive): a directory of per-iteration *_{iteration}.pt
-    # files, each {iteration -> [T_s, L, E] UNBIASED post-scoring-func gate
-    # scores}, from eval/sim/run_sim.py. Each sample stands in for `period`
-    # decode iterations of a request, with the period inferred from the spacing
-    # of the iteration ids in the filenames:
-    # sample = (decode_pos // period) % num_samples (wraps past the last).
+    # are mutually exclusive), from eval/sim/run_sim.py (see
+    # layers/moe/sim_gate_scores.py): one directory holding
+    #  - decode_gate_scores_{iteration}.pt: {iteration -> [T_s, L, E] UNBIASED
+    #    post-scoring-func gate scores} of one sim decode step. Each sample
+    #    stands in for `period` decode iterations of a request, with the period
+    #    inferred from the spacing of the iteration ids in the filenames:
+    #    sample = (decode_pos // period) % num_samples (wraps past the last).
+    #  - prefill_gate_scores_{iteration}.pt: {iteration -> list of per-request
+    #    [T_req, L, E] tensors} of one sim prefill step (ids may have gaps). A
+    #    request is assigned one prefill sample at its first chunk (round-robin
+    #    in id order) for all its prompt tokens; samples are reduced lazily on
+    #    first assignment. Both families are mandatory.
     SGLANG_SIM_GATE_SCORES_DIR = EnvStr(None)
 
     # BLAZE MoE routing (sim-load-penalized top-k, MLSys'26; supported MoE
     # models only -- see layers/moe/router_hook.py).
     # The paper's online EMA load tracker is replaced by per-sample load
-    # profiles from SGLANG_SIM_GATE_SCORES_DIR, replayed per request by decode
-    # position: at init, every sample is reduced to its vanilla top-k selection
-    # counts per (layer, expert), normalized to per-layer mean 1; the decode
-    # bias penalizes each request with the sample matching its own
-    # decoded-token count.
+    # profiles from SGLANG_SIM_GATE_SCORES_DIR: every sample is reduced to its
+    # vanilla top-k selection counts per (layer, expert), normalized to
+    # per-layer mean 1. Decode penalizes each request with the decode sample
+    # matching its own decoded-token count; prefill penalizes every prompt
+    # token with the request's fixed prefill sample.
     SGLANG_BLAZE_ROUTER = EnvBool(False)
     # Bias strength, fixed for the whole run (the paper's safety monitor that
     # adapts alpha is not implemented).
@@ -706,11 +721,12 @@ class Envs:
     # score-based token drop / expanded drop (ICLR'26; supported MoE models
     # only -- see layers/moe/router_hook.py).
     # SIM-THRESHOLD mode (our serving adaptation): the competing population is
-    # SGLANG_SIM_GATE_SCORES_DIR instead of the local decode batch. At init,
-    # per-sample per-expert score thresholds are computed (the C_s-th highest
+    # SGLANG_SIM_GATE_SCORES_DIR instead of the local batch. Per-sample
+    # per-expert score thresholds are computed (the C_s-th highest
     # sim-candidate score, -inf if the expert has fewer than C_s candidates);
-    # a real decode assignment survives iff its score is strictly above the
-    # threshold of the sample matching the request's decoded-token count.
+    # a real assignment survives iff its score is strictly above the threshold
+    # of the request's sample: at decode the decode sample matching its
+    # decoded-token count, at prefill its fixed prefill sample.
     SGLANG_CAI_ROUTER = EnvBool(False)
     # Capacity factor gamma: per-expert cap C_s = ceil(gamma * top_k * T_s / E)
     # where T_s is the sim sample's token count.

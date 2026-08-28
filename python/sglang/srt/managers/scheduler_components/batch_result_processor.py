@@ -175,7 +175,7 @@ class SchedulerBatchResultProcessor:
             req_pool_idx=req.req_pool_idx,
             seqlen=seqlen,
             req_to_token_pool=self.req_to_token_pool,
-        )  # [seqlen-1, num_layers, 2*k] int16; decode rows carry post-credit ids+creds
+        )  # [seqlen-1, num_layers, 2*k] int16; every row carries post-credit ids+creds
         record = capturer.apply_retract_snapshot(rid=req.rid, record=record)
         capturer.dump(
             rid=req.rid,
@@ -193,7 +193,7 @@ class SchedulerBatchResultProcessor:
             req_pool_idx=req.req_pool_idx,
             seqlen=seqlen,
             req_to_token_pool=self.req_to_token_pool,
-        )  # [seqlen-1, num_layers, k] int16; decode rows carry post-blaze ids
+        )  # [seqlen-1, num_layers, k] int16; every row carries post-blaze ids
         record = capturer.apply_retract_snapshot(rid=req.rid, record=record)
         capturer.dump(
             rid=req.rid,
@@ -211,7 +211,7 @@ class SchedulerBatchResultProcessor:
             req_pool_idx=req.req_pool_idx,
             seqlen=seqlen,
             req_to_token_pool=self.req_to_token_pool,
-        )  # [seqlen-1, num_layers, 2*k] int16; decode rows carry post-cai ids+weights
+        )  # [seqlen-1, num_layers, 2*k] int16; every row carries post-cai ids+weights
         record = capturer.apply_retract_snapshot(rid=req.rid, record=record)
         capturer.dump(
             rid=req.rid,

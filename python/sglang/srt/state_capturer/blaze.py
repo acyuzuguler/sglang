@@ -18,10 +18,11 @@ class BlazeCapturer(BaseTopkCapturer):
     """Per-token, per-layer record of the POST-blaze routing decision.
 
     Reuses the BaseTopkCapturer machinery (device buffer written inside the
-    forward / CUDA graph, host cache indexed by out_cache_loc). For each decode
-    token it stores the k expert ids selected AFTER the blaze load penalty
-    (what the model actually used), int16. Written by BlazeRouter._route_decode.
-    Prefill tokens are left zero (blaze only applies at decode).
+    forward / CUDA graph, host cache indexed by out_cache_loc). For every
+    token (prefill and decode) it stores the k expert ids selected AFTER the
+    blaze load penalty (what the model actually used), int16. Written by
+    BlazeRouter._route_rows; rows [:input_len] are the prefill-phase decisions
+    (penalized with the request's fixed prefill sample), the rest decode.
 
     Unlike the credit capturer there is no extra state channel: the guardrail /
     violation flags depend only on the gate scores and tau (not on alpha), so

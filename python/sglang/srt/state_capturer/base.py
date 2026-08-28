@@ -128,9 +128,9 @@ class BaseTopkCapturer:
         )
         # rid -> [rows, num_layers, topk_size] records saved at retraction time.
         # A retracted request re-prefills its generated-so-far tokens into NEW
-        # kv slots; a decode-only capturer never rewrites the host_cache rows
-        # for that span, so without this snapshot the pre-retraction part of
-        # the dump reads whatever request previously owned those slots.
+        # kv slots with PREFILL-phase routing; the snapshot keeps the decisions
+        # that actually generated those tokens (original prefill + decode
+        # records) in the dump instead of the re-prefill routing of that span.
         self._retract_snapshots = {}
 
     def capture(self, layer_id: int, topk_indices: torch.Tensor):
@@ -240,9 +240,11 @@ def snapshot_decode_records_on_retract(
     """Preserve a retracted request's per-token records before its kv slots
     are released (call from the scheduler's retraction path).
 
-    Only the decode-only capturers (credit / blaze / cai) need this: the
-    gate-scores capturer also records during prefill, so re-prefilling the
-    generated-so-far tokens rewrites its rows correctly."""
+    Only the routing-modification capturers (credit / blaze / cai) take the
+    snapshot: their prefill-phase records differ from the decode-phase ones,
+    so the dump keeps the decisions that generated the tokens rather than the
+    re-prefill routing of that span. The gate-scores capturer records the same
+    (routing-independent) scores in both phases and needs no snapshot."""
     from sglang.srt.state_capturer.blaze import get_global_blaze_capturer
     from sglang.srt.state_capturer.cai import get_global_cai_capturer
     from sglang.srt.state_capturer.credit import get_global_credit_capturer

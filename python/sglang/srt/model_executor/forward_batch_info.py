@@ -506,6 +506,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # current split index of layer
     split_index: int = 0
 
+    # Per-forward id stamped by the active MoE routing-modification router
+    # (credit / blaze / cai, layers/moe/router_hook.py) in its pre-forward hook.
+    # The eager runner hands the model a dataclasses.replace() copy of the live
+    # batch, so object identity can't tie a route() call to the hook that
+    # prepared it; this field survives the copy. None for forwards the hook never
+    # saw (the routers fail loudly on those).
+    moe_router_forward_id: Optional[int] = None
+
     # For multimodal
     mm_input_embeds: Optional[torch.Tensor] = None
 

@@ -2621,9 +2621,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             idx = sorted_indices.pop()
             req = self.reqs[idx]
             retracted_reqs.append(req)
-            # Decode-only capturers (credit/blaze/cai) must snapshot this
-            # request's records now: release_req frees its kv slots, and the
-            # re-prefill after retraction never rewrites those host-cache rows.
+            # The routing capturers (credit/blaze/cai) snapshot this request's
+            # records now: release_req frees its kv slots, and the re-prefill
+            # after retraction would overwrite the generated-so-far span with
+            # prefill-phase routing.
             from sglang.srt.state_capturer.base import (
                 snapshot_decode_records_on_retract,
             )

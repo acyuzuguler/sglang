@@ -8,12 +8,11 @@
 #
 # SIM-THRESHOLD mode (our serving adaptation of the paper's per-batch cap): the
 # competing population is an offline large-cluster simulation
-# (SGLANG_SIM_GATE_SCORES_DIR, a directory of per-iteration *_{iteration}.pt
-# files, each holding {iteration -> [T_s, L, E] UNBIASED post-scoring-func
-# gate scores}, produced by eval/sim/run_sim.py -- see sim_gate_scores.py)
-# instead of the local decode batch.
-# At init, for every sim sample s we compute per-layer per-expert score
-# thresholds:
+# (SGLANG_SIM_GATE_SCORES_DIR, a directory of per-iteration
+# decode_gate_scores_{iteration}.pt / prefill_gate_scores_{iteration}.pt files
+# holding UNBIASED post-scoring-func gate scores, produced by
+# eval/sim/run_sim.py -- see sim_gate_scores.py) instead of the local batch.
+# For a sim sample s we compute per-layer per-expert score thresholds:
 #   candidacy: each sim token nominates its top k_all = ceil(k * rounds)
 #     experts (rounds=1 is the paper's Token Drop, rounds>1 its Expanded Drop);
 #     nomination ranks on SELECTION scores (the noaux_tc correction bias added
@@ -23,13 +22,20 @@
 #     expert e's column, or -inf when the column has fewer than C_s candidates
 #     (open); per-expert thresholds stay in unbiased-score space because the
 #     bias is a per-expert constant that cancels in the column comparison.
-# At decode time a real token's candidate assignment (token, e) survives iff
-# its unbiased score is strictly > threshold[s, layer, e] (ties lose), where s
-# advances PER REQUEST with its own decoded-token count:
-#   s = (decode_pos // sample_period) % num_samples
-# with sample_period inferred from the spacing of the recorded iteration ids
-# (first decoded token -> sample 0; wraps past the last sample). Final
-# selection is top-k over the survivors. Weights are the original scores
+# A real token's candidate assignment (token, e) survives iff its unbiased score
+# is strictly > threshold[s, layer, e] (ties lose), where s is
+# - DECODE: the decode sample matching the request's own decoded-token count,
+#     s = (decode_pos // sample_period) % num_samples
+#   with sample_period inferred from the spacing of the recorded iteration ids
+#   (first decoded token -> sample 0; wraps past the last sample); all decode
+#   samples are reduced at init.
+# - PREFILL (EXTEND batches, eager): the prefill sample assigned to the request
+#   at its first chunk (round-robin over the prefill iterations in id order,
+#   sim_gate_scores.PrefillSampleTable) and kept for all its chunks. Prefill
+#   samples are ~60-100K tokens each (C_s ~ 3000 at gamma=1) and are reduced
+#   LAZILY the first time a sample is assigned (a few seconds per new sample
+#   during the first ~num_samples admitted requests, never at startup).
+# Final selection is top-k over the survivors. Weights are the original scores
 # renormalized over the surviving set; a slot with no survivor is "dropped" and
 # gets weight 0. The expert kernels still need a valid id in dropped slots, so
 # they keep whatever index topk produced there with weight 0 -- output-identical
@@ -40,18 +46,20 @@
 #
 # Every token routes independently against the precomputed thresholds (no
 # cross-request influence inside the server; the competition is with the sim
-# population), so results don't depend on scheduler batching. Prefill routes
-# vanilla. The per-slot decode-position counter is maintained eagerly in
-# on_forward_end (called with the real, un-padded forward_batch after every
-# forward): reset to 0 on extend (idempotent across chunked-prefill chunks; a
-# retracted request restarts at sample 0 on re-prefill; MIXED chunks count as
-# extend and would restart in-flight requests, but mixed chunking is never
-# enabled here), incremented after each decode forward. All decode-path ops are
-# fixed-shape (candidate scatter mask, per-token threshold gather, masked
-# topk) and the counter/threshold buffers are persistent device tensors
-# written eagerly between replays, so the routing is CUDA-graph safe. Padded
-# graph rows read pool slot 0's counter (ZERO padding policy), their outputs
-# are discarded, and nothing is written -- no masking needed.
+# population), so results don't depend on scheduler batching. The per-slot
+# decode-position counter is maintained eagerly in on_forward_end (called with
+# the real, un-padded forward_batch after every forward): reset to 0 on extend
+# (idempotent across chunked-prefill chunks; a retracted request restarts at
+# sample 0 on re-prefill, and draws a new prefill sample), incremented after
+# each decode forward. The prefill row -> slot context and sample assignment
+# happen eagerly in on_forward_start; MIXED chunks are rejected (asserted off at
+# startup). All decode-path ops are fixed-shape (candidate scatter mask,
+# per-token threshold gather, masked topk) and the counter/threshold buffers are
+# persistent device tensors written eagerly between replays, so the decode
+# routing is CUDA-graph safe. Padded graph rows read pool slot 0's counter (ZERO
+# padding policy), their outputs are discarded, and nothing is written -- no
+# masking needed. Prefill runs eagerly (prefill CUDA graphs must be disabled;
+# asserted at startup).
 #
 # NOTE: RoutedExpertsCapturer / the expert-distribution recorder fire inside
 # the model's vanilla TopK and therefore record PRE-cai ids; the actual post-cai
@@ -67,14 +75,19 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.router_hook import (
+    PrefillCtx,
+    assert_prefill_routing_server_args,
+    build_prefill_ctx,
+    check_prefill_ctx,
     resolve_moe_router_dims,
     selection_scores,
     weights_from_template,
 )
 from sglang.srt.layers.moe.sim_gate_scores import (
+    DECODE_LABEL,
+    PrefillSampleTable,
     load_sim_gate_scores_sample,
     scan_sim_gate_scores,
-    validate_sample,
 )
 from sglang.srt.layers.moe.topk import TopKOutputChecker, apply_scoring_func
 from sglang.srt.state_capturer.cai import get_global_cai_capturer
@@ -87,48 +100,47 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _compute_sim_thresholds(
+# Sim tokens moved to the device per step when reducing a sample (bounds the
+# transient working set to ~16 MB fp32 per layer chunk for E=256).
+_SIM_TOKEN_CHUNK = 16384
+
+
+def _sim_threshold_row(
     *,
-    path: str,
-    num_layers: int,
-    num_experts: int,
+    sample: torch.Tensor,
     top_k: int,
     k_all: int,
     gamma: float,
+    num_experts: int,
     correction_bias: Optional[torch.Tensor],
     device: str,
 ) -> tuple[torch.Tensor, int]:
-    """([S, L, E] float32 per-sample per-expert survival thresholds (see
-    header), sample_period inferred from the recorded iteration ids).
+    """([L, E] float32 per-expert survival thresholds of one sim sample (see
+    header), its capacity C_s).
 
-    Sim samples store UNBIASED scores; correction_bias ([L, E] or None) is
-    added only for the candidacy topk (matching the model's real selection
-    ranking) while the kth-value thresholds stay in unbiased-score space.
-    One sample file is loaded at a time and processed layer-by-layer on the
-    device (~25 MB working set) -- see load_sim_gate_scores_sample for the
-    mmap rationale.
+    Sim samples ([T, L, E] fp16 CPU) store UNBIASED scores; correction_bias
+    ([L, E] on `device` or None) is added only for the candidacy topk (matching
+    the model's real selection ranking) while the kth-value thresholds stay in
+    unbiased-score space. Processed layer-by-layer in token chunks on the
+    device: the C_s-th highest candidate score per column is the last of a
+    running top-C_s merged across chunks (top-C of a union == top-C of the
+    per-part top-Cs), identical to one topk over the whole column.
     """
-    entries, sample_period = scan_sim_gate_scores(path=path)
+    num_tokens, num_layers, sample_experts = sample.shape
+    if sample_experts != num_experts:
+        raise ValueError(f"sample has {sample_experts} experts, expected {num_experts}")
+    if num_tokens == 0:
+        raise ValueError("sim gate scores sample has no tokens.")
+    capacity = min(num_tokens, math.ceil(gamma * top_k * num_tokens / num_experts))
     thresholds = torch.full(
-        (len(entries), num_layers, num_experts),
-        -torch.inf,
-        dtype=torch.float32,
-        device=device,
+        (num_layers, num_experts), -torch.inf, dtype=torch.float32, device=device
     )
-    if correction_bias is not None:
-        correction_bias = correction_bias.to(device=device, dtype=torch.float32)
-    for si, (key, sample_file) in enumerate(entries):
-        sample = load_sim_gate_scores_sample(file_path=sample_file, iteration=key)
-        validate_sample(
-            key=key, sample=sample, num_layers=num_layers, num_experts=num_experts
-        )
-        sample = sample.clone()  # one sequential read of the mmap'd sample
-        num_tokens = sample.shape[0]
-        capacity = min(
-            num_tokens, math.ceil(gamma * top_k * num_tokens / num_experts)
-        )
-        for layer in range(num_layers):
-            scores = sample[:, layer, :].to(device=device, dtype=torch.float32)
+    for layer in range(num_layers):
+        running = None  # [<= capacity, E] best candidate scores so far, descending
+        for t0 in range(0, num_tokens, _SIM_TOKEN_CHUNK):
+            scores = sample[t0 : t0 + _SIM_TOKEN_CHUNK, layer, :].to(
+                device=device, dtype=torch.float32
+            )
             cand_scores = (
                 scores + correction_bias[layer]
                 if correction_bias is not None
@@ -138,19 +150,64 @@ def _compute_sim_thresholds(
             candidates = torch.zeros_like(scores, dtype=torch.bool).scatter(
                 -1, cand_ids, True
             )
-            kth = torch.topk(
-                scores.masked_fill(~candidates, -torch.inf), k=capacity, dim=0
-            ).values[-1]  # [E]; -inf where the column has < capacity candidates
-            thresholds[si, layer] = kth
+            pool = scores.masked_fill(~candidates, -torch.inf)
+            if running is not None:
+                pool = torch.cat([running, pool], dim=0)
+            running = torch.topk(pool, k=min(capacity, pool.shape[0]), dim=0).values
+        # running has exactly `capacity` rows (capacity <= num_tokens): the last is
+        # the C_s-th highest candidate score, -inf where the column has fewer than
+        # C_s candidates.
+        thresholds[layer] = running[-1]
+    return thresholds, capacity
+
+
+def _compute_sim_thresholds(
+    *,
+    entries: list,
+    label: str,
+    num_layers: int,
+    num_experts: int,
+    top_k: int,
+    k_all: int,
+    gamma: float,
+    correction_bias: Optional[torch.Tensor],
+    device: str,
+) -> torch.Tensor:
+    """[S, L, E] float32 per-sample per-expert survival thresholds for every
+    (iteration, file) entry of one dump family, loaded one sample at a time."""
+    thresholds = torch.full(
+        (len(entries), num_layers, num_experts),
+        -torch.inf,
+        dtype=torch.float32,
+        device=device,
+    )
+    for si, (key, sample_file) in enumerate(entries):
+        sample = load_sim_gate_scores_sample(
+            file_path=sample_file,
+            iteration=key,
+            label=label,
+            num_layers=num_layers,
+            num_experts=num_experts,
+        )
+        thresholds[si], capacity = _sim_threshold_row(
+            sample=sample,
+            top_k=top_k,
+            k_all=k_all,
+            gamma=gamma,
+            num_experts=num_experts,
+            correction_bias=correction_bias,
+            device=device,
+        )
         logger.info(
-            "CaiRouter: sim thresholds %d/%d (iteration %s, T=%d, C=%d)",
+            "CaiRouter: %s sim thresholds %d/%d (iteration %s, T=%d, C=%d)",
+            label,
             si + 1,
             len(entries),
             key,
-            num_tokens,
+            sample.shape[0],
             capacity,
         )
-    return thresholds, sample_period
+    return thresholds
 
 
 class CaiRouter:
@@ -178,6 +235,7 @@ class CaiRouter:
                 "SGLANG_CAI_ROUTER needs SGLANG_SIM_GATE_SCORES_DIR (the sim "
                 "population that survival thresholds are computed from)."
             )
+        assert_prefill_routing_server_args(feature="SGLANG_CAI_ROUTER")
         router = CaiRouter(
             num_layers=dims.num_layers,
             num_experts=dims.num_experts,
@@ -191,9 +249,10 @@ class CaiRouter:
         )
         logger.info(
             "CaiRouter enabled: experts=%d k=%d gamma=%.4f rounds=%d "
-            "(candidates per token k_all=%d) mode=sim-threshold num_samples=%d "
-            "sample_period=%d (inferred from the recorded iteration ids) "
-            "gate_scores_dir=%s capped_expert_columns=%.1f%%",
+            "(candidates per token k_all=%d) mode=sim-threshold decode: "
+            "num_samples=%d sample_period=%d (inferred from the recorded iteration "
+            "ids) capped_expert_columns=%.1f%%; prefill: num_samples=%d (lazy, "
+            "fixed per request) gate_scores_dir=%s",
             dims.num_experts,
             dims.top_k,
             router.gamma,
@@ -201,8 +260,9 @@ class CaiRouter:
             router.k_all,
             router.num_samples,
             router.sample_period,
-            gate_scores_dir,
             (100 * router.thresholds.isfinite().float().mean()).item(),
+            router.prefill_table.num_samples,
+            gate_scores_dir,
         )
         return router
 
@@ -232,10 +292,17 @@ class CaiRouter:
         self.k_all = min(num_experts, int(math.ceil(top_k * rounds)))
         self.debug = envs.SGLANG_CAI_DEBUG.get()
 
-        # [S, L, E] survival thresholds from the sim population (see header);
-        # the sample period is inferred from the recorded iteration ids.
-        self.thresholds, sample_period = _compute_sim_thresholds(
-            path=gate_scores_dir,
+        if correction_bias is not None:
+            correction_bias = correction_bias.to(device=device, dtype=torch.float32)
+
+        # [S, L, E] survival thresholds from the sim DECODE population (see
+        # header); the sample period is inferred from the recorded iteration ids.
+        decode_entries, sample_period = scan_sim_gate_scores(
+            path=gate_scores_dir, label=DECODE_LABEL
+        )
+        self.thresholds = _compute_sim_thresholds(
+            entries=decode_entries,
+            label=DECODE_LABEL,
             num_layers=num_layers,
             num_experts=num_experts,
             top_k=top_k,
@@ -249,22 +316,65 @@ class CaiRouter:
         self.num_samples = self.thresholds.shape[0]
         self.sample_period = sample_period
 
-        # Per-request-slot decoded-token counter (+ one spare row so an
-        # out-of-range pool index could never alias a live request). Written
-        # eagerly in on_forward_end with the real forward_batch, read inside
-        # the captured graph via the ZERO-padded req_pool_indices buffer.
-        self._decode_pos = torch.zeros(
-            max_running_requests + 1, dtype=torch.int64, device=device
+        # Request-pool slots are 1..max_running_requests (slot 0 is the pool's own
+        # padding row that padded graph rows read), so per-slot buffers hold
+        # max_running_requests + 1 rows.
+        num_slots = max_running_requests + 1
+        # Prefill sim population: per-request fixed sample, rows reduced lazily.
+        self.prefill_table = PrefillSampleTable(
+            path=gate_scores_dir,
+            num_layers=num_layers,
+            num_experts=num_experts,
+            num_slots=num_slots,
+            row_fn=lambda sample: _sim_threshold_row(
+                sample=sample,
+                top_k=top_k,
+                k_all=self.k_all,
+                gamma=gamma,
+                num_experts=num_experts,
+                correction_bias=correction_bias,
+                device=device,
+            )[0],
+            device=device,
+            name="CaiRouter",
         )
+        # Per-forward prefill context and the per-row sample index derived from it.
+        self._prefill_ctx: Optional[PrefillCtx] = None
+        self._prefill_tok_sample: Optional[torch.Tensor] = None
 
-        # On-device debug counters accumulated INSIDE the captured graph, read +
-        # zeroed host-side by on_forward_end after every decode forward. Layout:
+        # Per-request-slot decoded-token counter. Written eagerly in on_forward_end
+        # with the real forward_batch, read inside the captured graph via the
+        # ZERO-padded req_pool_indices buffer.
+        self._decode_pos = torch.zeros(num_slots, dtype=torch.int64, device=device)
+
+        # On-device debug counters: decode ones accumulated INSIDE the captured
+        # graph, prefill ones eagerly; both read + zeroed host-side by
+        # on_forward_end after the forward. Layout:
         # [layer_calls, tokens, dropped_slots, all_dropped_tokens, replaced_slots].
         self._stats = (
             torch.zeros(5, dtype=torch.int64, device=device) if self.debug else None
         )
-        self._t = 0
-        self._totals = [0, 0, 0, 0, 0]
+        self._stats_prefill = (
+            torch.zeros(5, dtype=torch.int64, device=device) if self.debug else None
+        )
+        self._t = {"decode": 0, "prefill": 0}
+        self._totals = {"decode": [0] * 5, "prefill": [0] * 5}
+
+    def on_forward_start(self, *, forward_batch: "ForwardBatch") -> None:
+        """Eager per-forward prefill bookkeeping (outside any CUDA graph): build the
+        row -> slot context, assign (and lazily reduce) the sim sample of every
+        request starting its prefill, and derive the per-row sample index."""
+        self._prefill_ctx = None
+        self._prefill_tok_sample = None
+        if not forward_batch.forward_mode.is_extend():
+            return
+        ctx = build_prefill_ctx(forward_batch=forward_batch, feature="SGLANG_CAI_ROUTER")
+        self.prefill_table.assign_first_chunks(
+            req_pool_indices=forward_batch.req_pool_indices,
+            first_chunk_rows=ctx.first_chunk_rows,
+        )
+        self._prefill_ctx = ctx
+        self._prefill_tok_sample = self.prefill_table.slot_sample[ctx.tok_slot]  # [T]
 
     def route(
         self,
@@ -277,16 +387,37 @@ class CaiRouter:
     ):
         # The caller passes the vanilla topk output in as template: it fixes the
         # correct output format/dtypes for the downstream expert kernels, and is
-        # the prefill / fallback path.
+        # the fallback path.
         topk_output = template
-        if not forward_batch.forward_mode.is_decode():
-            # Prefill/extend routes vanilla by design (counter reset happens in
-            # on_forward_end).
+        fm = forward_batch.forward_mode
+        if fm.is_idle():
             return topk_output
         if not TopKOutputChecker.format_is_standard(topk_output):
             raise RuntimeError(
                 "CAI routing needs the standard TopKOutput format; got an "
                 "unexpected MoE backend (bypassed / triton-kernels)."
+            )
+        if fm.is_extend():
+            check_prefill_ctx(
+                ctx=self._prefill_ctx,
+                forward_batch=forward_batch,
+                num_rows=router_logits.shape[0],
+                feature="SGLANG_CAI_ROUTER",
+            )
+            # Every token competes against its own request's fixed prefill sample.
+            threshold_rows = self.prefill_table.table[self._prefill_tok_sample, layer_id]
+            return self._route_rows(
+                layer_id,
+                router_logits,
+                threshold_rows,
+                topk_output,
+                topk_config,
+                self._stats_prefill,
+            )
+        if not fm.is_decode():
+            raise RuntimeError(
+                f"SGLANG_CAI_ROUTER: unsupported forward mode {fm.name} "
+                "(speculative decoding is not supported)."
             )
         if router_logits.shape[0] != forward_batch.req_pool_indices.shape[0]:
             raise RuntimeError(
@@ -294,13 +425,25 @@ class CaiRouter:
                 f"got {router_logits.shape[0]} rows for "
                 f"{forward_batch.req_pool_indices.shape[0]} requests."
             )
-        return self._route_decode(
-            layer_id, router_logits, forward_batch, topk_output, topk_config
+        # Each request competes against the sim sample matching its own decode
+        # position (see header). Per-token independent, so padded graph rows need
+        # no masking: their ZERO-padded req_pool_indices read pool slot 0's
+        # counter, their outputs are discarded, and nothing is written.
+        idx = forward_batch.req_pool_indices.long()  # [B]
+        s = (self._decode_pos[idx] // self.sample_period) % self.num_samples  # [B]
+        return self._route_rows(
+            layer_id,
+            router_logits,
+            self.thresholds[s, layer_id],
+            topk_output,
+            topk_config,
+            self._stats,
         )
 
-    def _route_decode(
-        self, layer_id, router_logits, forward_batch, template, topk_config
+    def _route_rows(
+        self, layer_id, router_logits, threshold_rows, template, topk_config, stats
     ):
+        """CAI selection for B rows given each row's [E] survival thresholds."""
         B = router_logits.shape[0]
         scores = apply_scoring_func(router_logits.float(), topk_config.scoring_func)
         # Selection scores rank candidacy and the final pick (adds the noaux_tc
@@ -315,14 +458,8 @@ class CaiRouter:
             -1, cand_ids, True
         )
 
-        # SIM-THRESHOLD survival (see header): each request competes against
-        # the sim sample matching its own decode position; strict > so ties
-        # lose. Per-token independent, so padded graph rows need no masking:
-        # their ZERO-padded req_pool_indices read pool slot 0's counter, their
-        # outputs are discarded, and nothing is written.
-        idx = forward_batch.req_pool_indices.long()  # [B]
-        s = (self._decode_pos[idx] // self.sample_period) % self.num_samples  # [B]
-        keep = candidates & (scores > self.thresholds[s, layer_id])
+        # SIM-THRESHOLD survival (see header): strict > so ties lose.
+        keep = candidates & (scores > threshold_rows)
 
         # Final per-token selection over the survivors (ranked on selection
         # scores); slots with no survivor are dropped: weight 0, and the
@@ -353,21 +490,21 @@ class CaiRouter:
             )
             cap.capture(layer_id, rec)  # [B, 2k]
 
-        if self._stats is not None:
+        if stats is not None:
             # Surviving slots whose expert is outside the vanilla top-k, as a set
             # difference so flips/reorderings don't count; dropped slots are counted
-            # separately, not as replacements. Counts include padded graph rows
-            # (~1 tail row per graph boundary; see the blaze router's note) --
+            # separately, not as replacements. Decode counts include padded graph
+            # rows (~1 tail row per graph boundary; see the blaze router's note) --
             # negligible, and it keeps the decode path free of batch-shape logic.
             in_vanilla = (
                 ids.unsqueeze(-1) == template.topk_ids.long().unsqueeze(-2)
             ).any(dim=-1)
             replaced = ~in_vanilla & ~dropped
-            self._stats[0] += 1
-            self._stats[1] += B  # python-int scalar add (capture-safe)
-            self._stats[2] += dropped.sum()
-            self._stats[3] += dropped.all(dim=-1).sum()
-            self._stats[4] += replaced.sum()
+            stats[0] += 1
+            stats[1] += B  # python-int scalar add (capture-safe)
+            stats[2] += dropped.sum()
+            stats[3] += dropped.all(dim=-1).sum()
+            stats[4] += replaced.sum()
 
         return template._replace(
             topk_weights=weights.to(template.topk_weights.dtype),
@@ -380,6 +517,7 @@ class CaiRouter:
         Called eagerly (outside any CUDA graph) after every forward with the
         real, un-padded forward_batch, so unlike the credit router's in-graph
         extend reset there is no padded-tail pool-slot-0 artifact here.
+        Non-debug runs do only the counter update (no per-step host sync).
         """
         fm = forward_batch.forward_mode
         if fm.is_extend():
@@ -393,20 +531,27 @@ class CaiRouter:
             # equals the number of tokens decoded so far.
             self._decode_pos[forward_batch.req_pool_indices.long()] += 1
 
-        if self._stats is None or not fm.is_decode():
+        if self._stats is None:
             return
-        d = self._stats.tolist()
-        self._stats.zero_()
-        self._totals = [a + b for a, b in zip(self._totals, d)]
-        self._t += 1
-        if self._t % 50 == 0:
-            layer_calls, tokens, dropped, all_dropped, replaced = self._totals
+        if fm.is_decode():
+            self._flush_stats(self._stats, "decode")
+        elif fm.is_extend():
+            self._flush_stats(self._stats_prefill, "prefill")
+
+    def _flush_stats(self, stats, phase):
+        d = stats.tolist()
+        stats.zero_()
+        self._totals[phase] = [a + b for a, b in zip(self._totals[phase], d)]
+        self._t[phase] += 1
+        if self._t[phase] % 50 == 0:
+            layer_calls, tokens, dropped, all_dropped, replaced = self._totals[phase]
             slots = max(tokens * self.top_k, 1)
             logger.info(
-                "[cai-debug] %d decode steps: layer_calls=%d tokens=%d "
+                "[cai-debug] %d %s steps: layer_calls=%d tokens=%d "
                 "gamma=%.3f rounds=%d mode=sim-threshold | dropped_slots=%.4f%% "
                 "replaced_slots=%.4f%% all_dropped_tokens=%.4f%%",
-                self._t,
+                self._t[phase],
+                phase,
                 layer_calls,
                 tokens,
                 self.gamma,

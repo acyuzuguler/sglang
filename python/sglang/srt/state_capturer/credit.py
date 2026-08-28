@@ -18,17 +18,22 @@ class CreditCapturer(BaseTopkCapturer):
     """Per-token, per-layer record of the POST-credit routing decision.
 
     Reuses the BaseTopkCapturer machinery (device buffer written inside the
-    forward / CUDA graph, host cache indexed by out_cache_loc). For each decode
-    token it stores, concatenated along the last dim (int16):
+    forward / CUDA graph, host cache indexed by out_cache_loc). For every
+    token (prefill and decode) it stores, concatenated along the last dim
+    (int16):
 
       [0:k]      selected expert ids AFTER the credit logic (what the model used)
-      [k:2k]     the credit balance of each selected expert at decision time
-                 (after regen, before spend) -- the values the selection saw.
+      [k:2k]     decode rows: the credit balance of each selected expert at
+                 decision time (after regen, before spend) -- the values the
+                 selection saw. Prefill rows: the request's per-expert budget for
+                 that chunk, T_req + prefill_max_cred (uniform over experts; an
+                 expert serves at most budget // prefill_cost of the chunk's tokens).
 
-    Written by CreditRouter._route_decode. Prefill tokens are left zero (credit
-    only applies at decode). Offline: gate_scores (input) + these ids (output)
-    reproduce/verify the credit selection; the per-request credit *vector* is
-    derivable by replaying regen/spend over the recorded id sequence.
+    Written by CreditRouter._route_prefill (rows [:input_len], prefill-phase
+    credits) and CreditRouter._route_decode (the rest, decode-phase credits).
+    Offline: gate_scores (input) + these ids (output) reproduce/verify the
+    credit selection; the per-request credit *vector* is derivable by replaying
+    regen/spend over the recorded id sequence.
     """
 
     @staticmethod

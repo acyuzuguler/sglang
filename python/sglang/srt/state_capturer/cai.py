@@ -18,16 +18,18 @@ class CaiCapturer(BaseTopkCapturer):
     """Per-token, per-layer record of the POST-CAI routing decision.
 
     Reuses the BaseTopkCapturer machinery (device buffer written inside the
-    forward / CUDA graph, host cache indexed by out_cache_loc). For each decode
-    token it stores, concatenated along the last dim (int16):
+    forward / CUDA graph, host cache indexed by out_cache_loc). For every
+    token (prefill and decode) it stores, concatenated along the last dim
+    (int16):
 
       [0:k]      selected expert ids AFTER the CAI capacity cap; -1 marks a dropped
                  slot (assignment cut by the cap: weight 0, no expert load)
       [k:2k]     the final renormalized routing weights, float16 bit-cast to
                  int16 (dump() views them back)
 
-    Written by CaiRouter._route_decode. Prefill tokens are left zero
-    (cai only applies at decode). The weights are recorded because the
+    Written by CaiRouter._route_rows; rows [:input_len] are the prefill-phase
+    decisions (against the request's fixed prefill sample), the rest decode.
+    The weights are recorded because the
     drop changes them structurally (zeros + renormalization over survivors);
     offline, gate_scores (input) + these ids/weights (output) reproduce and
     verify the cai selection without re-running the cap.

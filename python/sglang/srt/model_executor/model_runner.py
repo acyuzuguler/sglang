@@ -218,7 +218,10 @@ from sglang.srt.state_capturer.gate_scores import (
     get_global_gate_scores_capturer,
     set_global_gate_scores_capturer,
 )
-from sglang.srt.layers.moe.router_hook import collect_gate_correction_bias_if_needed
+from sglang.srt.layers.moe.router_hook import (
+    collect_gate_correction_bias_if_needed,
+    get_active_moe_router,
+)
 from sglang.srt.utils import (
     cpu_has_amx_support,
     enable_show_time_cost,
@@ -1405,10 +1408,12 @@ class ModelRunner:
             else contextlib.nullcontext()
         )
 
-        # Pre-forward hook: the credit router snapshots the live batch size for its
-        # in-graph padding mask before a potential CUDA-graph replay.
-        if (credit_router := get_global_credit_router()) is not None:
-            credit_router.on_forward_start(forward_batch=forward_batch)
+        # Pre-forward hook: the active MoE router (credit / blaze / cai) snapshots
+        # its per-forward state (live batch size for the in-graph padding mask,
+        # prefill row->request context, lazy prefill sim samples) before a
+        # potential CUDA-graph replay.
+        if (moe_router := get_active_moe_router()) is not None:
+            moe_router.on_forward_start(forward_batch=forward_batch)
 
         with (
             canary_ctx,
@@ -1462,7 +1467,6 @@ class ModelRunner:
 
         if (
             not self.is_draft_worker
-            and forward_batch.forward_mode.is_decode()  # credit buffer is decode-only
             and (credit_capturer := get_global_credit_capturer()) is not None
         ):
             credit_capturer.on_forward_end(
@@ -1477,7 +1481,6 @@ class ModelRunner:
 
         if (
             not self.is_draft_worker
-            and forward_batch.forward_mode.is_decode()  # blaze buffer is decode-only
             and (blaze_capturer := get_global_blaze_capturer()) is not None
         ):
             blaze_capturer.on_forward_end(
@@ -1492,7 +1495,6 @@ class ModelRunner:
 
         if (
             not self.is_draft_worker
-            and forward_batch.forward_mode.is_decode()  # capacity buffer is decode-only
             and (cai_capturer := get_global_cai_capturer()) is not None
         ):
             cai_capturer.on_forward_end(
