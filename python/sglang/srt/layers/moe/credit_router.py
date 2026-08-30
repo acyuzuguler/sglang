@@ -4,10 +4,20 @@
 # SGLANG_CREDIT_ROUTER; a no-op for every other model / when off.
 #
 # Two independent phases per request, with separate knobs
-# (SGLANG_CREDIT_{DECODE,PREFILL}_{MAX_CRED,COST}, SGLANG_CREDIT_DECODE_{RHO,KAPPA,PROTECT},
+# (SGLANG_CREDIT_{DECODE,PREFILL}_{MAX_CRED,COST}, SGLANG_CREDIT_DECODE_{RULE,BETA,RHO,KAPPA,PROTECT,COMPARATOR},
 # SGLANG_CREDIT_PREFILL_PROTECT):
 #
-# - DECODE (CUDA-graph safe; mirrors the sim's GateRouterCredit.get_decode_exp_ids /
+# - DECODE, rule "soft" (SGLANG_CREDIT_DECODE_RULE, the default and the rule we keep; mirrors the
+#   sim's select_expert_credit): every request holds an integer-valued credit balance per
+#   (layer, expert), initialized to decode_max_cred (reset by every extend chunk). Per decoded
+#   token: +1 credit (capped at decode_max_cred), then rank the experts on
+#       sel + beta * cred_e / max_e(cred) * s_max(t)
+#   and take the top-k (a drained expert loses up to beta * s_max of ranking score), then every
+#   selected expert pays decode_cost, floored at 0. Knobs decode_max_cred / decode_cost /
+#   decode_beta; rho, kappa, comparator are ignored and decode_protect must be 0.
+#
+# - DECODE, rule "debt" (reference only: 51 GPU runs in eval/exp_qwen/margin never beat "soft";
+#   mirrors the sim's GateRouterCredit.get_decode_exp_ids /
 #   select_experts_credit_decode, the causal form of the prefill budget): every request holds
 #   a float credit balance per (layer, expert) in `creds`, initialized to decode_max_cred (and
 #   reset to it by every extend chunk, so decode ALWAYS starts fresh after prefill). Per decoded
@@ -24,7 +34,11 @@
 #        bounded). The token takes the top-k of (pinned, then selectable experts by score, then
 #        the rest by score): an all-selectable token is routed as vanilla, a token that lost a
 #        pick takes its best selectable alternative, a token short of selectable experts falls
-#        back to its best dropped vanilla pick; nothing is dropped. Every kept pick raises the
+#        back to its best dropped vanilla pick; nothing is dropped. With decode_comparator "margin"
+#        the threshold enters the ranking as a penalty instead, topk(sel - thr_e): the expert then
+#        survives where it beats the best replacement by more than thr_e, i.e. it gives up its
+#        low-MARGIN tokens (bounded loss per replacement) instead of its low-scoring ones.
+#        Every kept pick raises the
 #        threshold by cost credits and every token lowers it by ~1, so an over-demanded expert
 #        converges to keeping (1 - rho)/cost + rho * demand picks per token, its HIGHEST-scoring
 #        ones (the sim bench: eval/sim/credit_decode_sweep_results.txt).
@@ -205,21 +219,27 @@ class CreditRouter:
             decode_rho=envs.SGLANG_CREDIT_DECODE_RHO.get(),
             decode_kappa=envs.SGLANG_CREDIT_DECODE_KAPPA.get(),
             decode_protect=envs.SGLANG_CREDIT_DECODE_PROTECT.get(),
+            decode_comparator=envs.SGLANG_CREDIT_DECODE_COMPARATOR.get(),
+            decode_rule=envs.SGLANG_CREDIT_DECODE_RULE.get(),
+            decode_beta=envs.SGLANG_CREDIT_DECODE_BETA.get(),
             prefill_protect=envs.SGLANG_CREDIT_PREFILL_PROTECT.get(),
             device=device,
         )
         logger.info(
             "CreditRouter enabled: layers=%d experts=%d k=%d "
-            "decode: max_cred=%d cost=%d rho=%s kappa=%s protect=%s | prefill: max_cred=%d cost=%d protect=%s "
+            "decode: rule=%s max_cred=%d cost=%d beta=%s rho=%s kappa=%s protect=%s comparator=%s | prefill: max_cred=%d cost=%d protect=%s "
             "(per-request token budget, sim semantics)",
             dims.num_layers,
             dims.num_experts,
             dims.top_k,
+            router.decode_rule,
             router.decode_max_cred,
             router.decode_cost,
+            router.decode_beta,
             router.decode_rho,
             router.decode_kappa,
             router.decode_protect,
+            router.decode_comparator,
             router.prefill_max_cred,
             router.prefill_cost,
             router.prefill_protect,
@@ -242,6 +262,9 @@ class CreditRouter:
         decode_protect: float,
         prefill_protect: float,
         device: str,
+        decode_comparator: str = "margin",
+        decode_rule: str = "soft",
+        decode_beta: float = 0.8,
     ):
         for name, value in (("decode_cost", decode_cost), ("prefill_cost", prefill_cost)):
             assert isinstance(value, int) and value >= 0, f"{name} must be a non-negative int, got {value!r}"
@@ -255,6 +278,16 @@ class CreditRouter:
             f"decode_protect must be in [0, 1], got {decode_protect!r}"
         assert 0.0 <= prefill_protect <= 1.0, \
             f"prefill_protect must be in [0, 1], got {prefill_protect!r}"
+        assert decode_comparator in ("score", "margin"), \
+            f"decode_comparator must be 'score' or 'margin', got {decode_comparator!r}"
+        assert decode_rule in ("soft", "debt"), \
+            f"decode_rule must be 'soft' or 'debt', got {decode_rule!r}"
+        assert decode_beta >= 0, f"decode_beta must be >= 0, got {decode_beta!r}"
+        if decode_rule == "soft":
+            assert decode_protect == 0.0, \
+                f"decode top-1 protection exists only for decode_rule='debt', got decode_protect={decode_protect!r}"
+        self.decode_rule = decode_rule   # Python constant: capture-stable branch in _route_decode
+        self.decode_beta = decode_beta
         self.num_experts = num_experts
         self.top_k = top_k
         self.decode_max_cred = decode_max_cred
@@ -264,6 +297,7 @@ class CreditRouter:
         self.decode_rho = decode_rho
         self.decode_kappa = decode_kappa
         self.decode_protect = decode_protect
+        self.decode_comparator = decode_comparator   # Python constant: capture-stable branch below
         self.prefill_protect = prefill_protect
         # Request-pool slots are 1..max_running_requests (slot 0 is the pool's own
         # padding row), so the buffer holds max_running_requests + 2 rows: one per
@@ -495,6 +529,11 @@ class CreditRouter:
         # noaux_tc correction bias when the model has one; identity otherwise).
         sel = selection_scores(scores=scores, topk_config=topk_config)  # [B, E]
 
+        if self.decode_rule == "soft":
+            return self._route_decode_soft(
+                layer_id, scores, sel, safe_idx, valid, valid_f, template, topk_config
+            )
+
         # The model's own top-k (the template) is the vanilla set: it defines the demanded
         # experts for the regeneration rebate and the top-1 for protection.
         vanilla = torch.zeros_like(sel, dtype=torch.bool).scatter(1, template.topk_ids.long(), True)
@@ -515,17 +554,19 @@ class CreditRouter:
             * sel.max(dim=-1, keepdim=True)[0]
             * (1.0 - creds / self.decode_max_cred).clamp(min=0)
         )
-        ok = sel >= thr
         if self.decode_protect > 0:
             pinned = self._decode_pinned(
                 scores=scores, sel=sel, vanilla=vanilla, safe_idx=safe_idx, layer_id=layer_id, valid_f=valid_f
             )
         else:
-            pinned = torch.zeros_like(ok)
+            pinned = torch.zeros_like(vanilla)
         big = 2.0 * (sel.amax() - sel.amin()) + 2.0
-        _, ids = torch.topk(
-            sel - big * (~ok & ~pinned).float() + big * pinned.float(), self.top_k, dim=-1
-        )  # [B, k]
+        if self.decode_comparator == "score":
+            ok = sel >= thr
+            ranked = sel - big * (~ok & ~pinned).float() + big * pinned.float()
+        else:  # "margin": the threshold is a ranking penalty, pinned experts pay none
+            ranked = sel - thr * (~pinned).float() + big * pinned.float()
+        _, ids = torch.topk(ranked, self.top_k, dim=-1)  # [B, k]
 
         # Routing weights renormalized from the ORIGINAL (unbiased) scores of the
         # selection, scaled to the vanilla row convention.
@@ -545,6 +586,52 @@ class CreditRouter:
         if cap is not None:
             # Post-credit ids + the credit each selected expert held at decision time
             # (post-regen, pre-spend), rounded to int16 (negative = debt).
+            sel_creds = torch.gather(creds, 1, ids).round().clamp(-32768, 32767)  # [B, k]
+            rec = torch.cat([ids.to(torch.int16), sel_creds.to(torch.int16)], dim=1)
+            cap.capture(layer_id, rec)  # [B, 2k]
+
+        if self.debug:
+            changed = (ids.long() != template.topk_ids.long()).any(dim=-1) & valid  # [B]
+            self._dbg[0] += 1
+            self._dbg[2] += spend.sum().round().to(torch.int64)
+            self._dbg[3] += changed.sum()
+            self._dbg[4] += B
+            self._dbg[5] += valid.sum()
+
+        return template._replace(
+            topk_weights=weights.to(template.topk_weights.dtype),
+            topk_ids=ids.to(template.topk_ids.dtype),
+        )
+
+    def _route_decode_soft(self, layer_id, scores, sel, safe_idx, valid, valid_f, template, topk_config):
+        """Decode rule "soft" (header; sim: select_expert_credit + CreditManager with rho 0 and
+        floor at 0). Same buffers as the debt rule (float32 creds holding integer values), all
+        ops elementwise / gather / scatter / topk: CUDA-graph safe."""
+        B = scores.shape[0]
+        # Regenerate: +1 credit for real rows, capped at max_cred.
+        creds = torch.clamp(self.creds[safe_idx, layer_id, :] + valid_f, max=self.decode_max_cred)
+
+        # Soft credit bias: rank by sel + beta * creds/creds_rowmax * sel_rowmax. The rowmax
+        # denominator is clamped to 1 so a fully drained row cannot divide by zero (creds >= 0).
+        cred_bias = creds / creds.max(dim=-1, keepdim=True)[0].clamp(min=1.0) * sel.max(dim=-1, keepdim=True)[0]
+        _, ids = torch.topk(sel + self.decode_beta * cred_bias, self.top_k, dim=-1)  # [B, k]
+
+        weights = weights_from_template(
+            gathered_scores=torch.gather(scores, 1, ids),
+            template=template,
+            topk_config=topk_config,
+        )
+
+        # Spend: every selected expert pays cost (real rows only), floored at 0.
+        spend = torch.zeros_like(creds).scatter_(
+            1, ids, (self.decode_cost * valid_f).expand(-1, self.top_k)
+        )
+        self.creds[safe_idx, layer_id, :] = torch.clamp(creds - spend, min=0.0)
+
+        cap = get_global_credit_capturer()
+        if cap is not None:
+            # Post-credit ids + the credit each selected expert held at decision time
+            # (post-regen, pre-spend); integer-valued, fits int16.
             sel_creds = torch.gather(creds, 1, ids).round().clamp(-32768, 32767)  # [B, k]
             rec = torch.cat([ids.to(torch.int16), sel_creds.to(torch.int16)], dim=1)
             cap.capture(layer_id, rec)  # [B, 2k]

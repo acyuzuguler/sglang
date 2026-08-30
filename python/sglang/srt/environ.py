@@ -676,14 +676,23 @@ class Envs:
     # keeps about 1/COST picks per token of a request.
     SGLANG_CREDIT_DECODE_COST = EnvInt(8)
     SGLANG_CREDIT_PREFILL_COST = EnvInt(4)
-    # Decode: debt-driven score threshold (credit_router.py header). RHO: an expert in the
-    # token's vanilla top-k regenerates (1-RHO) + RHO*COST credits instead of 1 (keeps the
-    # request's hot experts ordered by demand); KAPPA: threshold at credit 0 in units of the
-    # token's top score, thr = KAPPA * s_max * (1 - cred/MAX_CRED)^+; PROTECT: fraction of
-    # tokens per request/layer whose top-1 expert is always kept (running w1 quantile, 0 = off).
-    SGLANG_CREDIT_DECODE_RHO = EnvFloat(0.2)
+    # Decode rule (credit_router.py header): "soft" (default, the kept rule) ranks on
+    # sel + BETA * cred/cred_max * sel_max with integer credits (+1 per token, floored at 0);
+    # "debt" is the debt-driven score threshold (reference only, never beat "soft" on accuracy).
+    SGLANG_CREDIT_DECODE_RULE = EnvStr("soft")
+    SGLANG_CREDIT_DECODE_BETA = EnvFloat(0.8)
+    # "debt" knobs. RHO: an expert in the token's vanilla top-k regenerates (1-RHO) + RHO*COST
+    # credits instead of 1 (keeps the request's hot experts ordered by demand); KAPPA: threshold
+    # at credit 0 in units of the token's top score, thr = KAPPA * s_max * (1 - cred/MAX_CRED)^+;
+    # PROTECT: fraction of tokens per request/layer whose top-1 expert is always kept (running w1
+    # quantile, 0 = off; must be 0 under "soft").
+    SGLANG_CREDIT_DECODE_RHO = EnvFloat(0.4)
     SGLANG_CREDIT_DECODE_KAPPA = EnvFloat(1.0)
-    SGLANG_CREDIT_DECODE_PROTECT = EnvFloat(0.5)
+    SGLANG_CREDIT_DECODE_PROTECT = EnvFloat(0.0)
+    # COMPARATOR ("debt"): "score" (an over-demanded expert is selectable iff its own score clears
+    # its debt threshold, it gives up its low-scoring tokens) or "margin" (the threshold enters the
+    # top-k ranking as a penalty, it gives up its low-margin tokens); same controller either way.
+    SGLANG_CREDIT_DECODE_COMPARATOR = EnvStr("margin")
     # Prefill is a hard per-request token budget (an expert serves at most
     # (T + PREFILL_MAX_CRED) // PREFILL_COST of a request's chunk tokens); PROTECT is the
     # fraction of tokens per request/layer whose top-1 expert is always kept (sim protect_p).
