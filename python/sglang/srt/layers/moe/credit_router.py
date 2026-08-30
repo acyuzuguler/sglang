@@ -4,49 +4,17 @@
 # SGLANG_CREDIT_ROUTER; a no-op for every other model / when off.
 #
 # Two independent phases per request, with separate knobs
-# (SGLANG_CREDIT_{DECODE,PREFILL}_{MAX_CRED,COST}, SGLANG_CREDIT_DECODE_{RULE,BETA,RHO,KAPPA,PROTECT,COMPARATOR},
-# SGLANG_CREDIT_PREFILL_PROTECT):
+# (SGLANG_CREDIT_{DECODE,PREFILL}_{MAX_CRED,COST}, SGLANG_CREDIT_DECODE_BETA, SGLANG_CREDIT_PREFILL_PROTECT):
 #
-# - DECODE, rule "soft" (SGLANG_CREDIT_DECODE_RULE, the default and the rule we keep; mirrors the
-#   sim's select_expert_credit): every request holds an integer-valued credit balance per
-#   (layer, expert), initialized to decode_max_cred (reset by every extend chunk). Per decoded
-#   token: +1 credit (capped at decode_max_cred), then rank the experts on
+# - DECODE (CUDA-graph safe; mirrors the sim's select_expert_credit + CreditManager): every
+#   request holds an integer-valued credit balance per (layer, expert) in `creds`, initialized to
+#   decode_max_cred (and reset to it by every extend chunk, so decode ALWAYS starts fresh after
+#   prefill). Per decoded token: +1 credit (capped at decode_max_cred), then rank the experts on
 #       sel + beta * cred_e / max_e(cred) * s_max(t)
-#   and take the top-k (a drained expert loses up to beta * s_max of ranking score), then every
-#   selected expert pays decode_cost, floored at 0. Knobs decode_max_cred / decode_cost /
-#   decode_beta; rho, kappa, comparator are ignored and decode_protect must be 0.
-#
-# - DECODE, rule "debt" (reference only: 51 GPU runs in eval/exp_qwen/margin never beat "soft";
-#   mirrors the sim's GateRouterCredit.get_decode_exp_ids /
-#   select_experts_credit_decode, the causal form of the prefill budget): every request holds
-#   a float credit balance per (layer, expert) in `creds`, initialized to decode_max_cred (and
-#   reset to it by every extend chunk, so decode ALWAYS starts fresh after prefill). Per decoded
-#   token, in this order:
-#     1. regenerate: +1 credit, or (1 - rho) + rho * decode_cost for the experts in the token's
-#        vanilla top-k (the template): the demand rebate that keeps the request's hot experts
-#        ordered by demand instead of flattening them to one cap (prefill overdraft rho).
-#        Unused credit does not bank beyond decode_max_cred; the balance is NOT floored at 0,
-#        a hot expert runs into debt.
-#     2. select: expert e is selectable iff its SELECTION score (post-scoring-func gate score,
-#        plus the noaux_tc correction bias when the model has one) clears its own threshold
-#            thr_e = kappa * s_max(t) * max(0, 1 - cred_e / decode_max_cred)
-#        (credit 0: only a top-1 pick survives; deeper debt: nothing does, so the debt is
-#        bounded). The token takes the top-k of (pinned, then selectable experts by score, then
-#        the rest by score): an all-selectable token is routed as vanilla, a token that lost a
-#        pick takes its best selectable alternative, a token short of selectable experts falls
-#        back to its best dropped vanilla pick; nothing is dropped. With decode_comparator "margin"
-#        the threshold enters the ranking as a penalty instead, topk(sel - thr_e): the expert then
-#        survives where it beats the best replacement by more than thr_e, i.e. it gives up its
-#        low-MARGIN tokens (bounded loss per replacement) instead of its low-scoring ones.
-#        Every kept pick raises the
-#        threshold by cost credits and every token lowers it by ~1, so an over-demanded expert
-#        converges to keeping (1 - rho)/cost + rho * demand picks per token, its HIGHEST-scoring
-#        ones (the sim bench: eval/sim/credit_decode_sweep_results.txt).
-#        Protection (decode_protect = p in [0, 1]): a token keeps its vanilla top-1 expert when
-#        its top-1 share w1 = s1 / sum(top-k unbiased scores) is above the request's running
-#        estimate of the (1 - p)-quantile of w1 (`w1_thr`, one float per slot and layer, a
-#        Robbins-Monro tracker; p = 1 pins every top-1, 0 = off). Pinned picks still pay.
-#     3. spend: every selected expert pays decode_cost (real rows only).
+#   (sel = post-scoring-func gate score plus the noaux_tc correction bias when the model has one)
+#   and take the top-k, so a drained expert loses up to beta * s_max of ranking score and the
+#   token takes its next-best expert instead; then every selected expert pays decode_cost,
+#   floored at 0 (real rows only). Knobs decode_max_cred / decode_cost / decode_beta.
 #
 # - PREFILL (EXTEND batches, eager; mirrors the sim's select_experts_credit_prefill):
 #   a hard, request-local token budget. Per chunk, request (T = its rows in this chunk)
@@ -216,30 +184,20 @@ class CreditRouter:
             prefill_max_cred=envs.SGLANG_CREDIT_PREFILL_MAX_CRED.get(),
             decode_cost=envs.SGLANG_CREDIT_DECODE_COST.get(),
             prefill_cost=envs.SGLANG_CREDIT_PREFILL_COST.get(),
-            decode_rho=envs.SGLANG_CREDIT_DECODE_RHO.get(),
-            decode_kappa=envs.SGLANG_CREDIT_DECODE_KAPPA.get(),
-            decode_protect=envs.SGLANG_CREDIT_DECODE_PROTECT.get(),
-            decode_comparator=envs.SGLANG_CREDIT_DECODE_COMPARATOR.get(),
-            decode_rule=envs.SGLANG_CREDIT_DECODE_RULE.get(),
             decode_beta=envs.SGLANG_CREDIT_DECODE_BETA.get(),
             prefill_protect=envs.SGLANG_CREDIT_PREFILL_PROTECT.get(),
             device=device,
         )
         logger.info(
             "CreditRouter enabled: layers=%d experts=%d k=%d "
-            "decode: rule=%s max_cred=%d cost=%d beta=%s rho=%s kappa=%s protect=%s comparator=%s | prefill: max_cred=%d cost=%d protect=%s "
+            "decode: max_cred=%d cost=%d beta=%s | prefill: max_cred=%d cost=%d protect=%s "
             "(per-request token budget, sim semantics)",
             dims.num_layers,
             dims.num_experts,
             dims.top_k,
-            router.decode_rule,
             router.decode_max_cred,
             router.decode_cost,
             router.decode_beta,
-            router.decode_rho,
-            router.decode_kappa,
-            router.decode_protect,
-            router.decode_comparator,
             router.prefill_max_cred,
             router.prefill_cost,
             router.prefill_protect,
@@ -257,14 +215,9 @@ class CreditRouter:
         prefill_max_cred: int,
         decode_cost: int,
         prefill_cost: int,
-        decode_rho: float,
-        decode_kappa: float,
-        decode_protect: float,
+        decode_beta: float,
         prefill_protect: float,
         device: str,
-        decode_comparator: str = "margin",
-        decode_rule: str = "soft",
-        decode_beta: float = 0.8,
     ):
         for name, value in (("decode_cost", decode_cost), ("prefill_cost", prefill_cost)):
             assert isinstance(value, int) and value >= 0, f"{name} must be a non-negative int, got {value!r}"
@@ -272,21 +225,9 @@ class CreditRouter:
             f"decode_max_cred must be a positive int, got {decode_max_cred!r}"
         assert isinstance(prefill_max_cred, int) and prefill_max_cred >= 0, \
             f"prefill_max_cred must be a non-negative int, got {prefill_max_cred!r}"
-        assert 0.0 <= decode_rho <= 1.0, f"decode_rho must be in [0, 1], got {decode_rho!r}"
-        assert decode_kappa >= 0, f"decode_kappa must be >= 0, got {decode_kappa!r}"
-        assert 0.0 <= decode_protect <= 1.0, \
-            f"decode_protect must be in [0, 1], got {decode_protect!r}"
+        assert decode_beta >= 0, f"decode_beta must be >= 0, got {decode_beta!r}"
         assert 0.0 <= prefill_protect <= 1.0, \
             f"prefill_protect must be in [0, 1], got {prefill_protect!r}"
-        assert decode_comparator in ("score", "margin"), \
-            f"decode_comparator must be 'score' or 'margin', got {decode_comparator!r}"
-        assert decode_rule in ("soft", "debt"), \
-            f"decode_rule must be 'soft' or 'debt', got {decode_rule!r}"
-        assert decode_beta >= 0, f"decode_beta must be >= 0, got {decode_beta!r}"
-        if decode_rule == "soft":
-            assert decode_protect == 0.0, \
-                f"decode top-1 protection exists only for decode_rule='debt', got decode_protect={decode_protect!r}"
-        self.decode_rule = decode_rule   # Python constant: capture-stable branch in _route_decode
         self.decode_beta = decode_beta
         self.num_experts = num_experts
         self.top_k = top_k
@@ -294,10 +235,6 @@ class CreditRouter:
         self.prefill_max_cred = prefill_max_cred
         self.decode_cost = decode_cost
         self.prefill_cost = prefill_cost
-        self.decode_rho = decode_rho
-        self.decode_kappa = decode_kappa
-        self.decode_protect = decode_protect
-        self.decode_comparator = decode_comparator   # Python constant: capture-stable branch below
         self.prefill_protect = prefill_protect
         # Request-pool slots are 1..max_running_requests (slot 0 is the pool's own
         # padding row), so the buffer holds max_running_requests + 2 rows: one per
@@ -305,25 +242,20 @@ class CreditRouter:
         # CUDA-graph replay can never touch a live request's credit state.
         self.num_slots = max_running_requests + 2
         self.pad_slot = max_running_requests + 1
-        # Decode-phase credits (see header): float32 because the demand rebate (1 - rho) +
-        # rho * cost is fractional, and the balance may go negative (debt). Prefill keeps no
-        # cross-forward state.
+        # Decode-phase credits (see header), integer-valued in a float32 buffer. Prefill keeps
+        # no cross-forward state.
         self.creds = torch.full(
             (self.num_slots, num_layers, num_experts),
             float(decode_max_cred),
             dtype=torch.float32,
             device=device,
         )
-        # Per (slot, layer) running estimate of the (1 - decode_protect)-quantile of the
-        # top-1 share w1 (decode top-1 protection, see header); 0 = protect every token.
-        self.w1_thr = torch.zeros((self.num_slots, num_layers), dtype=torch.float32, device=device)
         # Device-side rows for the in-graph decode-buffer resets: assigning a Python scalar
         # to a CUDA slice is an illegal CPU->CUDA copy during CUDA-graph capture, so we keep
         # preallocated on-device values to broadcast instead.
         self.max_cred_row = torch.full(
             (num_experts,), float(decode_max_cred), dtype=torch.float32, device=device
         )
-        self.w1_zero = torch.zeros((1,), dtype=torch.float32, device=device)
         # Per-forward prefill context (row -> slot map, validated per layer) and the
         # per-request budget of the chunk; both rebuilt by on_forward_start for EXTEND
         # batches and None otherwise.
@@ -407,7 +339,6 @@ class CreditRouter:
             valid = torch.arange(idx.shape[0], device=idx.device) < self._num_valid
             safe_idx = torch.where(valid, idx, torch.full_like(idx, self.pad_slot))
             self.creds[safe_idx, layer_id, :] = self.max_cred_row
-            self.w1_thr[safe_idx, layer_id] = self.w1_zero
             if self.debug:
                 self._dbg[1] += 1
             check_prefill_ctx(
@@ -529,85 +460,8 @@ class CreditRouter:
         # noaux_tc correction bias when the model has one; identity otherwise).
         sel = selection_scores(scores=scores, topk_config=topk_config)  # [B, E]
 
-        if self.decode_rule == "soft":
-            return self._route_decode_soft(
-                layer_id, scores, sel, safe_idx, valid, valid_f, template, topk_config
-            )
-
-        # The model's own top-k (the template) is the vanilla set: it defines the demanded
-        # experts for the regeneration rebate and the top-1 for protection.
-        vanilla = torch.zeros_like(sel, dtype=torch.bool).scatter(1, template.topk_ids.long(), True)
-
-        # 1. Regenerate (real rows only): (1 - rho) + rho * cost for demanded experts, 1 for the
-        # rest (rho = 0), capped at max_cred from above, no floor at 0 (debt). Sim: CreditManager.add_cred.
-        regen = (1.0 - self.decode_rho) + (self.decode_rho * self.decode_cost) * vanilla.float()
-        creds = torch.clamp(self.creds[safe_idx, layer_id, :] + regen * valid_f, max=self.decode_max_cred)
-
-        # 2. Select (sim: select_experts_credit_decode). Debt-driven threshold on the expert's
-        # OWN selection score, thr = kappa * s_max * (1 - cred/max_cred)^+; then one top-k over
-        # three disjoint score bands: pinned (+big), selectable (as is), unselectable (-big).
-        # `big` exceeds the score range (a 0-d device tensor, no host sync), so the bands never
-        # mix and the order inside each band stays the raw score order (fallback = the best
-        # dropped vanilla pick). All ops are elementwise / gather / topk: CUDA-graph safe.
-        thr = (
-            self.decode_kappa
-            * sel.max(dim=-1, keepdim=True)[0]
-            * (1.0 - creds / self.decode_max_cred).clamp(min=0)
-        )
-        if self.decode_protect > 0:
-            pinned = self._decode_pinned(
-                scores=scores, sel=sel, vanilla=vanilla, safe_idx=safe_idx, layer_id=layer_id, valid_f=valid_f
-            )
-        else:
-            pinned = torch.zeros_like(vanilla)
-        big = 2.0 * (sel.amax() - sel.amin()) + 2.0
-        if self.decode_comparator == "score":
-            ok = sel >= thr
-            ranked = sel - big * (~ok & ~pinned).float() + big * pinned.float()
-        else:  # "margin": the threshold is a ranking penalty, pinned experts pay none
-            ranked = sel - thr * (~pinned).float() + big * pinned.float()
-        _, ids = torch.topk(ranked, self.top_k, dim=-1)  # [B, k]
-
-        # Routing weights renormalized from the ORIGINAL (unbiased) scores of the
-        # selection, scaled to the vanilla row convention.
-        weights = weights_from_template(
-            gathered_scores=torch.gather(scores, 1, ids),
-            template=template,
-            topk_config=topk_config,
-        )
-
-        # 3. Spend: every selected expert pays cost (real rows only; pinned or not). No floor.
-        spend = torch.zeros_like(creds).scatter_(
-            1, ids, (self.decode_cost * valid_f).expand(-1, self.top_k)
-        )
-        self.creds[safe_idx, layer_id, :] = creds - spend
-
-        cap = get_global_credit_capturer()
-        if cap is not None:
-            # Post-credit ids + the credit each selected expert held at decision time
-            # (post-regen, pre-spend), rounded to int16 (negative = debt).
-            sel_creds = torch.gather(creds, 1, ids).round().clamp(-32768, 32767)  # [B, k]
-            rec = torch.cat([ids.to(torch.int16), sel_creds.to(torch.int16)], dim=1)
-            cap.capture(layer_id, rec)  # [B, 2k]
-
-        if self.debug:
-            changed = (ids.long() != template.topk_ids.long()).any(dim=-1) & valid  # [B]
-            self._dbg[0] += 1
-            self._dbg[2] += spend.sum().round().to(torch.int64)
-            self._dbg[3] += changed.sum()
-            self._dbg[4] += B
-            self._dbg[5] += valid.sum()
-
-        return template._replace(
-            topk_weights=weights.to(template.topk_weights.dtype),
-            topk_ids=ids.to(template.topk_ids.dtype),
-        )
-
-    def _route_decode_soft(self, layer_id, scores, sel, safe_idx, valid, valid_f, template, topk_config):
-        """Decode rule "soft" (header; sim: select_expert_credit + CreditManager with rho 0 and
-        floor at 0). Same buffers as the debt rule (float32 creds holding integer values), all
-        ops elementwise / gather / scatter / topk: CUDA-graph safe."""
-        B = scores.shape[0]
+        # Sim: CreditManager + select_expert_credit. All ops elementwise / gather / scatter /
+        # topk on preallocated buffers: CUDA-graph safe.
         # Regenerate: +1 credit for real rows, capped at max_cred.
         creds = torch.clamp(self.creds[safe_idx, layer_id, :] + valid_f, max=self.decode_max_cred)
 
@@ -648,24 +502,6 @@ class CreditRouter:
             topk_weights=weights.to(template.topk_weights.dtype),
             topk_ids=ids.to(template.topk_ids.dtype),
         )
-
-    # Robbins-Monro step of the per-(slot, layer) w1 quantile tracker, in w1 units (w1 is a
-    # share of routing mass in [1/k, 1]); same constant as the sim's GateRouterCredit._decode_pinned.
-    W1_ETA = 0.01
-
-    def _decode_pinned(self, *, scores, sel, vanilla, safe_idx, layer_id, valid_f):
-        """[B, E] bool: the vanilla top-1 pick of the tokens whose top-1 share w1 (unbiased
-        weight space, like the prefill's _protected_top1) is at or above the request's running
-        (1 - decode_protect)-quantile estimate; the estimate is then updated (real rows only) so
-        that P(w1 < thr) -> 1 - p, i.e. about the p most confident tokens keep their top-1.
-        Sim: GateRouterCredit._decode_pinned. CUDA-graph safe (elementwise + gather/scatter)."""
-        top1 = sel.masked_fill(~vanilla, float("-inf")).argmax(dim=-1, keepdim=True)  # [B, 1]
-        w1 = scores.gather(1, top1) / (scores * vanilla).sum(dim=-1, keepdim=True)  # [B, 1]
-        thr = self.w1_thr[safe_idx, layer_id].unsqueeze(1)  # [B, 1] pre-update estimate
-        prot = w1 >= thr
-        step = self.W1_ETA * ((1.0 - self.decode_protect) - (w1 < thr).float()) * valid_f
-        self.w1_thr[safe_idx, layer_id] = (thr + step).squeeze(1)
-        return torch.zeros_like(vanilla).scatter(1, top1, prot)
 
     def debug_flush(self):
         """Read + zero the on-device debug counters (host sync; call outside the graph)."""
