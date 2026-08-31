@@ -676,8 +676,11 @@ class Envs:
     SGLANG_CREDIT_DECODE_COST = EnvInt(8)
     SGLANG_CREDIT_PREFILL_COST = EnvInt(4)
     # Decode rule (credit_router.py header): rank on sel + BETA * cred/cred_max * sel_max with
-    # integer credits (+1 per token, -COST per pick, floored at 0).
+    # integer credits (+1 per token, -COST per pick, no floor). DECODE_PROTECT is the decode
+    # analogue of PREFILL_PROTECT: the fraction of tokens per request/layer whose top-1 expert
+    # is always kept (per-request running quantile of the top-1 share; 0 = off, 1 = every token).
     SGLANG_CREDIT_DECODE_BETA = EnvFloat(0.8)
+    SGLANG_CREDIT_DECODE_PROTECT = EnvFloat(0.0)
     # Prefill is a hard per-request token budget (an expert serves at most
     # (T + PREFILL_MAX_CRED) // PREFILL_COST of a request's chunk tokens); PROTECT is the
     # fraction of tokens per request/layer whose top-1 expert is always kept (sim protect_p).

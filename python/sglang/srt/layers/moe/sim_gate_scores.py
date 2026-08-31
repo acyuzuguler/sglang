@@ -16,7 +16,8 @@
 #       [T_req, num_layers, num_experts] of one sim PREFILL step (the whole
 #       prompt of every request admitted in that step; ~60-100K tokens in
 #       total). Elements may be fp16 or fp32 (the sim stores attacker prompts
-#       as fp32 stride-0 broadcast views); the loader casts every element to
+#       as fp16 stride-0 broadcast views; dumps from before 2026-08-31 stored
+#       them as fp32); the loader casts every element to
 #       fp16 and concatenates them into one [sum T_req, L, E] tensor. The ids
 #       may have gaps (steps that admitted no request record nothing); the
 #       routers assign prefill samples per request in id order, so no period
