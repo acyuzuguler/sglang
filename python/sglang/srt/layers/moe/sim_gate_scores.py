@@ -6,12 +6,21 @@
 # scripts): ONE DIRECTORY holding two families of per-iteration files, each a
 # torch.save'd single-entry dict {iteration -> payload} with the iteration id
 # in the filename:
-#   decode_gate_scores_{iteration}.pt   payload = [T_s, num_layers, num_experts]
-#       fp16 UNBIASED post-scoring-func gate scores of one sim DECODE step
-#       (T_s = that step's decode batch size). The iteration ids are uniformly
-#       spaced; their spacing IS the recording frequency: one sample stands in
-#       for that many decode iterations of a request (the sample_period used
-#       by the routers' decode-position replay).
+#   decode_gate_scores_{iteration}.pt   payload =
+#       [T_s, specdec_len, num_layers, num_experts] fp16 UNBIASED
+#       post-scoring-func gate scores of one sim DECODE step: T_s verify blocks
+#       (that step's decode batch size) of specdec_len rows each (root + MTP
+#       draft candidates, accepted or rejected; specdec_len == 1 when the dump
+#       was recorded without speculation). Every verify row is a token the sim
+#       GPU routed that step, so the loader flattens the blocks into one
+#       [T_s * specdec_len, L, E] token population (same convention as the
+#       sim's decode imbalance metric). Pre-MTP 3-D [T_s, L, E] dumps are
+#       rejected loudly. The iteration ids are uniformly spaced; their spacing
+#       IS the recording frequency: one sample stands in for that many decode
+#       iterations of a request (the sample_period used by the routers'
+#       decode-position replay; under MTP a sim iteration is a verify step, not
+#       a single generated token, and the replay clock still maps one server
+#       decode token to one sim iteration).
 #   prefill_gate_scores_{iteration}.pt  payload = list of per-request tensors
 #       [T_req, num_layers, num_experts] of one sim PREFILL step (the whole
 #       prompt of every request admitted in that step; ~60-100K tokens in
@@ -124,12 +133,14 @@ def load_sim_gate_scores_sample(
 ) -> torch.Tensor:
     """The validated, OWNING [T, L, E] gate-scores tensor of one dump file.
 
-    Decode files hold the tensor directly; prefill files hold a list of
-    per-request tensors (mixed fp16/fp32, see header) that is cast to fp16 per
-    element and concatenated. mmap keeps host RAM bounded: only the sample's
-    pages are read, and the returned tensor is a fresh copy (callers must not
-    clone it again), so at most one sample (~0.3 GB decode, ~2 GB prefill) is
-    resident at a time and the multi-GB dump never is.
+    Decode files hold one [T_s, specdec_len, L, E] tensor of verify blocks that
+    is flattened to [T_s * specdec_len, L, E] (every verify row is a routed sim
+    token, see header); prefill files hold a list of per-request [T_req, L, E]
+    tensors (mixed fp16/fp32, see header) that is cast to fp16 per element and
+    concatenated. mmap keeps host RAM bounded: only the sample's pages are
+    read, and the returned tensor is a fresh copy (callers must not clone it
+    again), so at most one sample (~0.3 GB decode, ~2 GB prefill) is resident
+    at a time and the multi-GB dump never is.
     """
     data = torch.load(file_path, map_location="cpu", mmap=True)
     if not isinstance(data, dict) or iteration not in data:
@@ -140,10 +151,25 @@ def load_sim_gate_scores_sample(
         )
     payload = data[iteration]
     if label == DECODE_LABEL:
-        validate_sample(
-            key=iteration, sample=payload, num_layers=num_layers, num_experts=num_experts
-        )
-        return payload.clone()  # one sequential read of the mmap'd sample
+        if (
+            not isinstance(payload, torch.Tensor)
+            or payload.ndim != 4
+            or tuple(payload.shape[2:]) != (num_layers, num_experts)
+        ):
+            hint = (
+                " (a 3-D [T, L, E] payload is a pre-MTP dump; regenerate it "
+                "with the current eval/sim/run_sim.py)"
+                if isinstance(payload, torch.Tensor) and payload.ndim == 3
+                else ""
+            )
+            raise ValueError(
+                f"decode sim gate scores sample {iteration} must be a "
+                f"[T, specdec_len, {num_layers}, {num_experts}] tensor, got "
+                f"{tuple(payload.shape) if isinstance(payload, torch.Tensor) else type(payload).__name__}"
+                + hint
+            )
+        # flatten(0, 1) is a view of the mmap'd tensor; clone = one sequential read.
+        return payload.flatten(0, 1).clone()
     if label == PREFILL_LABEL:
         if not isinstance(payload, list) or len(payload) == 0:
             raise ValueError(

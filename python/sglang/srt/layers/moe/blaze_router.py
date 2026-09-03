@@ -6,7 +6,9 @@
 # directory of per-iteration decode_gate_scores_{iteration}.pt /
 # prefill_gate_scores_{iteration}.pt files, produced by eval/sim/run_sim.py
 # -- see sim_gate_scores.py; samples always store UNBIASED post-scoring-func
-# scores). Every sim sample is reduced to its vanilla top-k selection counts per
+# scores, and decode files hold [T_s, specdec_len, L, E] MTP verify blocks that
+# the loader flattens into one [T_s * specdec_len, L, E] token population).
+# Every sim sample is reduced to its vanilla top-k selection counts per
 # (layer, expert) -- adding the noaux_tc correction bias for the selection when
 # the model has one -- normalized to per-layer mean 1 (Eq. 5).
 # - DECODE: all decode samples are reduced at init; a request is penalized with

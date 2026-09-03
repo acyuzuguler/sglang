@@ -11,13 +11,16 @@
 # (SGLANG_SIM_GATE_SCORES_DIR, a directory of per-iteration
 # decode_gate_scores_{iteration}.pt / prefill_gate_scores_{iteration}.pt files
 # holding UNBIASED post-scoring-func gate scores, produced by
-# eval/sim/run_sim.py -- see sim_gate_scores.py) instead of the local batch.
+# eval/sim/run_sim.py -- see sim_gate_scores.py; decode files hold
+# [T_s, specdec_len, L, E] MTP verify blocks that the loader flattens into one
+# [T_s * specdec_len, L, E] token population) instead of the local batch.
 # For a sim sample s we compute per-layer per-expert score thresholds:
 #   candidacy: each sim token nominates its top k_all = ceil(k * rounds)
 #     experts (rounds=1 is the paper's Token Drop, rounds>1 its Expanded Drop);
 #     nomination ranks on SELECTION scores (the noaux_tc correction bias added
 #     when the model has one), matching the model's real vanilla ranking
 #   capacity:  C_s = ceil(gamma * k * T_s / E), T_s = sim sample token count
+#     (for decode samples: all flattened verify rows, T_s = batch * specdec_len)
 #   threshold[s, l, e] = the C_s-th highest sim-candidate UNBIASED score in
 #     expert e's column, or -inf when the column has fewer than C_s candidates
 #     (open); per-expert thresholds stay in unbiased-score space because the

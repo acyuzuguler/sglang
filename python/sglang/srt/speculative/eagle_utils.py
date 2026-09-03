@@ -606,6 +606,16 @@ def eagle_sample(
 
     sanitize_nan_logits(next_token_logits, "verify: target model logits")
 
+    # Custom logit processors (e.g. thinking-budget forcing) must be applied
+    # per draft position: stock processors index logits[i] per request, so one
+    # flat [bs * draft_token_num, vocab] call would misindex rows.
+    if sampling_info.has_custom_logit_processor:
+        from sglang.srt.layers.sampler import apply_custom_logit_processor
+
+        logits_3d = next_token_logits.view(bs, verify_input.draft_token_num, -1)
+        for j in range(verify_input.draft_token_num):
+            apply_custom_logit_processor(logits_3d[:, j, :], sampling_info)
+
     # Apply penalty
     # This is a relaxed version of penalties for speculative decoding.
     if sampling_info.acc_additive_penalties is not None:

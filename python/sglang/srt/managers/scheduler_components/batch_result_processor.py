@@ -149,6 +149,20 @@ class SchedulerBatchResultProcessor:
                 req.routed_experts_start_len,
             )
 
+    def _maybe_commit_verify_scores(self, req: Req, accept_tokens: List[int]):
+        """Commit this decode step's stashed verify-score block (gate scores of
+        ALL draft candidate tokens, accepted and rejected) plus the accept run
+        into the gate-scores capturer; dumped with the finished request as
+        "decode_scores" / "accept_tokens"."""
+        capturer = get_global_gate_scores_capturer()
+        if capturer is None:
+            return
+        capturer.commit_verify_step(
+            rid=req.rid,
+            req_pool_idx=req.req_pool_idx,
+            accept_tokens=accept_tokens,
+        )
+
     def _maybe_dump_gate_scores(self, req: Req):
         capturer = get_global_gate_scores_capturer()
         if capturer is None:
@@ -164,6 +178,7 @@ class SchedulerBatchResultProcessor:
             scores=scores,
             input_len=len(req.origin_input_ids),
             output_len=len(req.output_ids_through_stop),
+            output_ids=req.output_ids_through_stop,
         )
 
     def _maybe_dump_credit(self, req: Req):
@@ -786,6 +801,9 @@ class SchedulerBatchResultProcessor:
 
             req.output_ids.extend(next_token_id)
             new_accept_len = len(next_token_id)
+
+            if is_spec:
+                self._maybe_commit_verify_scores(req, next_token_id)
 
             self._maybe_update_reasoning_tokens(req, next_token_id)
             req.time_stats.set_last_decode_finish_time()

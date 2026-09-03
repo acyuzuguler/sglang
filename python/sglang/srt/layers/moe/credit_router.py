@@ -17,13 +17,12 @@
 #   token takes its next-best expert instead; then every selected expert pays decode_cost,
 #   with NO floor (real rows only): an over-demanded expert runs into debt (negative credit,
 #   negative bias) until it has regenerated. Knobs decode_max_cred / decode_cost / decode_beta.
-#   Protection (decode_protect = p in [0, 1], the decode analogue of the prefill rule below): a
-#   token keeps its vanilla top-1 expert when its top-1 share w1 = s1 / sum(top-k unbiased
-#   scores) is at or above the request's running estimate of the (1 - p)-quantile of w1
-#   (`w1_thr`, one float per slot and layer, a Robbins-Monro tracker that starts at 0 and is
-#   reset by every extend chunk like the credits); the pinned expert is lifted above every other
-#   in the ranking, the remaining k - 1 slots follow the credit bias. p = 1 pins every top-1,
-#   0 = off. Pinned picks still pay.
+#   Protection (decode_protect = p in [0, 1]): a token keeps its vanilla top-1 expert (slot 0
+#   of the model's own top-k) when its top-1 share w1 = s1 / sum(top-k unbiased scores)
+#   exceeds the absolute cutoff 1 - p. Stateless (a fixed cutoff, no per-request tracker);
+#   the pinned expert is lifted above every other in the ranking, the remaining k - 1 slots
+#   follow the credit bias. p = 1 pins every top-1 (w1 > 0 always), 0 = off (w1 <= 1 never
+#   exceeds the cutoff, strict comparison). Pinned picks still pay.
 #
 # - PREFILL (EXTEND batches, eager; mirrors the sim's select_experts_credit_prefill):
 #   a hard, request-local token budget. Per chunk, request (T = its rows in this chunk)
@@ -265,16 +264,12 @@ class CreditRouter:
             dtype=torch.float32,
             device=device,
         )
-        # Per (slot, layer) running estimate of the (1 - decode_protect)-quantile of the
-        # top-1 share w1 (decode top-1 protection, see header); 0 = protect every token.
-        self.w1_thr = torch.zeros((self.num_slots, num_layers), dtype=torch.float32, device=device)
-        # Device-side rows for the in-graph decode-buffer resets: assigning a Python scalar
+        # Device-side row for the in-graph decode credit reset: assigning a Python scalar
         # to a CUDA slice is an illegal CPU->CUDA copy during CUDA-graph capture, so we keep
-        # preallocated on-device values to broadcast instead.
+        # a preallocated on-device value to broadcast instead.
         self.max_cred_row = torch.full(
             (num_experts,), float(decode_max_cred), dtype=torch.float32, device=device
         )
-        self.w1_zero = torch.zeros((1,), dtype=torch.float32, device=device)
         # Per-forward prefill context (row -> slot map, validated per layer) and the
         # per-request budget of the chunk; both rebuilt by on_forward_start for EXTEND
         # batches and None otherwise.
@@ -358,7 +353,6 @@ class CreditRouter:
             valid = torch.arange(idx.shape[0], device=idx.device) < self._num_valid
             safe_idx = torch.where(valid, idx, torch.full_like(idx, self.pad_slot))
             self.creds[safe_idx, layer_id, :] = self.max_cred_row
-            self.w1_thr[safe_idx, layer_id] = self.w1_zero
             if self.debug:
                 self._dbg[1] += 1
             check_prefill_ctx(
@@ -493,11 +487,9 @@ class CreditRouter:
         if self.decode_protect > 0:
             # Top-1 protection (header): the pinned expert is lifted above every other by `big`
             # (a 0-d device tensor exceeding the ranking range, no host sync), the remaining
-            # k - 1 slots follow the credit bias. Sim: GateRouterCredit._decode_pinned.
-            vanilla = torch.zeros_like(sel, dtype=torch.bool).scatter(1, template.topk_ids.long(), True)
-            pinned = self._decode_pinned(
-                scores=scores, sel=sel, vanilla=vanilla, safe_idx=safe_idx, layer_id=layer_id, valid_f=valid_f
-            )
+            # k - 1 slots follow the credit bias. Sim: the pinned mask in
+            # GateRouterCredit.get_decode_exp_ids.
+            pinned = self._decode_pinned(scores=scores, vanilla_ids=template.topk_ids.long())
             big = 2.0 * (ranked.amax() - ranked.amin()) + 2.0
             ranked = ranked + big * pinned.float()
         _, ids = torch.topk(ranked, self.top_k, dim=-1)  # [B, k]
@@ -535,23 +527,17 @@ class CreditRouter:
             topk_ids=ids.to(template.topk_ids.dtype),
         )
 
-    # Robbins-Monro step of the per-(slot, layer) w1 quantile tracker, in w1 units (w1 is a
-    # share of routing mass in [1/k, 1]); same constant as the sim's GateRouterCredit._decode_pinned.
-    W1_ETA = 0.01
-
-    def _decode_pinned(self, *, scores, sel, vanilla, safe_idx, layer_id, valid_f):
-        """[B, E] bool: the vanilla top-1 pick of the tokens whose top-1 share w1 (unbiased
-        weight space, like the prefill's _protected_top1) is at or above the request's running
-        (1 - decode_protect)-quantile estimate; the estimate is then updated (real rows only) so
-        that P(w1 < thr) -> 1 - p, i.e. about the p most confident tokens keep their top-1.
-        Sim: GateRouterCredit._decode_pinned. CUDA-graph safe (elementwise + gather/scatter)."""
-        top1 = sel.masked_fill(~vanilla, float("-inf")).argmax(dim=-1, keepdim=True)  # [B, 1]
-        w1 = scores.gather(1, top1) / (scores * vanilla).sum(dim=-1, keepdim=True)  # [B, 1]
-        thr = self.w1_thr[safe_idx, layer_id].unsqueeze(1)  # [B, 1] pre-update estimate
-        prot = w1 >= thr
-        step = self.W1_ETA * ((1.0 - self.decode_protect) - (w1 < thr).float()) * valid_f
-        self.w1_thr[safe_idx, layer_id] = (thr + step).squeeze(1)
-        return torch.zeros_like(vanilla).scatter(1, top1, prot)
+    def _decode_pinned(self, *, scores: torch.Tensor, vanilla_ids: torch.Tensor) -> torch.Tensor:
+        """[B, E] bool: the vanilla top-1 pick (slot 0 of the model's own top-k, exactly the
+        slot the sim's recorded ids preserve) of the tokens whose top-1 share
+        w1 = s1 / sum(top-k unbiased scores) exceeds the absolute cutoff 1 - decode_protect.
+        Stateless (no per-request tracker, so nothing to reset or mask for padded rows).
+        Sim: the pinned mask in GateRouterCredit.get_decode_exp_ids. CUDA-graph safe
+        (gather/scatter on static shapes, no host sync). vanilla_ids: [B, k] int64."""
+        van_scores = scores.gather(1, vanilla_ids)  # [B, k] unbiased scores of the vanilla picks
+        w1 = van_scores[:, :1] / van_scores.sum(dim=-1, keepdim=True)  # [B, 1]
+        pinned = torch.zeros_like(scores, dtype=torch.bool)
+        return pinned.scatter(1, vanilla_ids[:, :1], w1 > 1.0 - self.decode_protect)
 
     def debug_flush(self):
         """Read + zero the on-device debug counters (host sync; call outside the graph)."""
