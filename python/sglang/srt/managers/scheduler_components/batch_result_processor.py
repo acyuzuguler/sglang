@@ -181,6 +181,16 @@ class SchedulerBatchResultProcessor:
             output_ids=req.output_ids_through_stop,
         )
 
+    def _maybe_credit_router_on_finish(self, req: Req):
+        """Drop the credit balance the router saved for this request at retraction
+        (credit_router.on_retract); a no-op for never-retracted requests."""
+        from sglang.srt.layers.moe.credit_router import get_global_credit_router
+
+        router = get_global_credit_router()
+        if router is None:
+            return
+        router.on_finish(rid=req.rid)
+
     def _maybe_dump_credit(self, req: Req):
         capturer = get_global_credit_capturer()
         if capturer is None:
@@ -329,6 +339,7 @@ class SchedulerBatchResultProcessor:
                         self._maybe_collect_routed_experts(req)
                         self._maybe_dump_gate_scores(req)
                         self._maybe_dump_credit(req)
+                        self._maybe_credit_router_on_finish(req)
                         self._maybe_dump_blaze(req)
                         self._maybe_dump_cai(req)
                         self._maybe_collect_indexer_topk(req)
@@ -983,6 +994,7 @@ class SchedulerBatchResultProcessor:
             self._maybe_collect_routed_experts(req)
             self._maybe_dump_gate_scores(req)
             self._maybe_dump_credit(req)
+            self._maybe_credit_router_on_finish(req)
             self._maybe_dump_blaze(req)
             self._maybe_dump_cai(req)
             self._maybe_collect_indexer_topk(req)

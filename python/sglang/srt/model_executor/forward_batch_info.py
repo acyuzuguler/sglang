@@ -513,6 +513,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # prepared it; this field survives the copy. None for forwards the hook never
     # saw (the routers fail loudly on those).
     moe_router_forward_id: Optional[int] = None
+    # Per-request retraction counts, parallel to `rids` (stamped by init_new; None for
+    # batches built elsewhere, e.g. CUDA-graph capture). A request with a count > 0 in an
+    # EXTEND batch is being re-prefilled after a KV-cache retraction; the credit router
+    # restores that request's saved credit balance instead of resetting it
+    # (layers/moe/credit_router.py, on_forward_start).
+    moe_router_retraction_counts: Optional[List[int]] = None
 
     # For multimodal
     mm_input_embeds: Optional[torch.Tensor] = None
@@ -742,6 +748,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_lens_cpu=batch.encoder_lens_cpu,
             lora_ids=[req.lora_id for req in batch.reqs],
             rids=[req.rid for req in batch.reqs],
+            moe_router_retraction_counts=[req.retraction_count for req in batch.reqs],
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,

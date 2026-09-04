@@ -237,8 +237,9 @@ def snapshot_decode_records_on_retract(
     seqlen: int,
     req_to_token_pool: ReqToTokenPool,
 ):
-    """Preserve a retracted request's per-token records before its kv slots
-    are released (call from the scheduler's retraction path).
+    """Preserve a retracted request's per-token records, and the credit router's
+    per-request state, before its kv slots are released (call from the
+    scheduler's retraction path).
 
     Only the routing-modification capturers (credit / blaze / cai) take the
     snapshot: their prefill-phase records differ from the decode-phase ones,
@@ -262,3 +263,12 @@ def snapshot_decode_records_on_retract(
                 seqlen=seqlen,
                 req_to_token_pool=req_to_token_pool,
             )
+
+    # The credit router keeps live per-request state (the decode credit balance) in
+    # the pool slot being released; save it so the re-prefill restores it instead of
+    # resetting to max_cred (credit_router.on_forward_start).
+    from sglang.srt.layers.moe.credit_router import get_global_credit_router
+
+    credit_router = get_global_credit_router()
+    if credit_router is not None:
+        credit_router.on_retract(rid=rid, req_pool_idx=req_pool_idx)

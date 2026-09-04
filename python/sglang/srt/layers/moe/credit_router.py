@@ -9,8 +9,14 @@
 #
 # - DECODE (CUDA-graph safe; mirrors the sim's select_expert_credit + CreditManager): every
 #   request holds an integer-valued credit balance per (layer, expert) in `creds`, initialized to
-#   decode_max_cred (and reset to it by every extend chunk, so decode ALWAYS starts fresh after
-#   prefill). Per decoded token: +1 credit (capped at decode_max_cred), then rank the experts on
+#   decode_max_cred and reset to it by every extend chunk of a NEW request, so decode starts
+#   fresh after prefill. A request the scheduler retracted (KV pool full) is re-prefilled later
+#   through the same extend path; its balance is saved at retraction (on_retract, called from
+#   the scheduler's retraction hook before the pool slot is released) and written back into
+#   its new slot instead of the reset (on_forward_start), so its decode continues with the
+#   credits it had. The re-prefilled rows themselves (prompt + tokens generated so far) are
+#   routed with the PREFILL rule below.
+#   Per decoded token: +1 credit (capped at decode_max_cred), then rank the experts on
 #       sel + beta * cred_e / max_e(cred) * s_max(t)
 #   (sel = post-scoring-func gate score plus the noaux_tc correction bias when the model has one)
 #   and take the top-k, so a drained expert loses up to beta * s_max of ranking score and the
@@ -50,7 +56,7 @@
 
 import logging
 import math
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Dict, Optional
 
 import msgspec
 import torch
@@ -270,6 +276,12 @@ class CreditRouter:
         self.max_cred_row = torch.full(
             (num_experts,), float(decode_max_cred), dtype=torch.float32, device=device
         )
+        # Retraction support (header): the decode balance of every retracted request, saved
+        # per rid by on_retract until the request finishes (on_finish) or is retracted again
+        # (overwritten), and the per-forward slot mask that exempts the re-prefilled requests
+        # of the current EXTEND forward from the max-credit reset in route().
+        self._saved_creds: Dict[str, torch.Tensor] = {}
+        self._keep_slot = torch.zeros(self.num_slots, dtype=torch.bool, device=device)
         # Per-forward prefill context (row -> slot map, validated per layer) and the
         # per-request budget of the chunk; both rebuilt by on_forward_start for EXTEND
         # batches and None otherwise.
@@ -307,7 +319,8 @@ class CreditRouter:
         graph replay reads this step's real row count; IDLE batches have batch_size
         0, which masks every row: a replayed decode graph then touches no state,
         matching the eager IDLE no-op), and for EXTEND batches builds the prefill
-        context (row -> slot map) and the per-request token budget of the chunk.
+        context (row -> slot map) and the per-request token budget of the chunk, and
+        restores the saved credit balance of re-prefilled (retracted) requests.
         """
         self._num_valid.fill_(forward_batch.batch_size)
         self._prefill_ctx = None
@@ -326,6 +339,7 @@ class CreditRouter:
             protect=self.prefill_protect,
             device=ctx.tok_slot.device,
         )
+        self._restore_retracted(forward_batch=forward_batch)
 
     def route(
         self,
@@ -347,12 +361,17 @@ class CreditRouter:
 
         if fm.is_extend():
             # (Re)initialize this layer's DECODE credit rows to max_cred so decode starts
-            # fresh after prefill (idempotent across prefill chunks). Padded rows (only
-            # present under a padded extend CUDA graph or its capture) are redirected to
-            # the pad_slot sink so they can never reset a live request's credits.
+            # fresh after prefill (idempotent across prefill chunks), except for the rows of
+            # retracted requests being re-prefilled, which keep the balance on_forward_start
+            # restored (header). Padded rows (only present under a padded extend CUDA graph
+            # or its capture) are redirected to the pad_slot sink so they can never reset a
+            # live request's credits.
             valid = torch.arange(idx.shape[0], device=idx.device) < self._num_valid
             safe_idx = torch.where(valid, idx, torch.full_like(idx, self.pad_slot))
-            self.creds[safe_idx, layer_id, :] = self.max_cred_row
+            keep = self._keep_slot[safe_idx].unsqueeze(1)  # [B, 1]
+            self.creds[safe_idx, layer_id, :] = torch.where(
+                keep, self.creds[safe_idx, layer_id, :], self.max_cred_row
+            )
             if self.debug:
                 self._dbg[1] += 1
             check_prefill_ctx(
@@ -538,6 +557,62 @@ class CreditRouter:
         w1 = van_scores[:, :1] / van_scores.sum(dim=-1, keepdim=True)  # [B, 1]
         pinned = torch.zeros_like(scores, dtype=torch.bool)
         return pinned.scatter(1, vanilla_ids[:, :1], w1 > 1.0 - self.decode_protect)
+
+    # ---- retraction support (header) ---------------------------------------------------
+
+    def on_retract(self, *, rid: str, req_pool_idx: int) -> None:
+        """Scheduler hook for a request being retracted, called BEFORE its pool slot is
+        released: keep its decode credit balance so the re-prefill can restore it. A request
+        retracted again later overwrites its earlier save with the newer balance."""
+        assert 0 <= req_pool_idx < self.pad_slot, (req_pool_idx, self.pad_slot)
+        self._saved_creds[rid] = self.creds[req_pool_idx].clone()  # [L, E]
+        if self.debug:
+            logger.info(
+                "[credit-debug] retract: saved credits of rid=%s from slot %d (sum %.0f)",
+                rid, req_pool_idx, self._saved_creds[rid].sum().item(),
+            )
+
+    def on_finish(self, *, rid: str) -> None:
+        """Scheduler hook at request completion: drop the saved balance, if any."""
+        self._saved_creds.pop(rid, None)
+
+    def _restore_retracted(self, *, forward_batch: "ForwardBatch") -> None:
+        """EXTEND forwards only (eager). Write the saved balance of every retracted request
+        in the batch into its (new) pool slot and mark the slot so route() skips the
+        max-credit reset for it; idempotent across the chunks of one re-prefill. Fails
+        loudly on a retracted request without a save (the retraction hook was bypassed)."""
+        self._keep_slot.zero_()
+        counts = forward_batch.moe_router_retraction_counts
+        if counts is None:
+            raise RuntimeError(
+                "SGLANG_CREDIT_ROUTER: EXTEND batch without moe_router_retraction_counts "
+                "(not built by ForwardBatch.init_new), cannot tell re-prefilled requests apart."
+            )
+        if not any(c > 0 for c in counts):
+            return
+        rids = forward_batch.rids
+        slots = forward_batch.req_pool_indices.tolist()  # host sync; re-prefill batches only
+        assert len(rids) == len(slots) == len(counts), (len(rids), len(slots), len(counts))
+        restored = []
+        for slot, rid, count in zip(slots, rids, counts):
+            if count == 0:
+                continue
+            saved = self._saved_creds.get(rid)
+            if saved is None:
+                raise RuntimeError(
+                    f"SGLANG_CREDIT_ROUTER: rid={rid} (slot {slot}, retracted {count}x) is "
+                    "re-prefilled but has no saved credit balance."
+                )
+            self.creds[slot] = saved
+            restored.append(slot)
+            if self.debug:
+                logger.info(
+                    "[credit-debug] re-prefill: restored credits of rid=%s into slot %d (sum %.0f)",
+                    rid, slot, saved.sum().item(),
+                )
+        self._keep_slot[
+            torch.tensor(restored, dtype=torch.long, device=self._keep_slot.device)
+        ] = True
 
     def debug_flush(self):
         """Read + zero the on-device debug counters (host sync; call outside the graph)."""

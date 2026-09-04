@@ -2624,7 +2624,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # The routing capturers (credit/blaze/cai) snapshot this request's
             # records now: release_req frees its kv slots, and the re-prefill
             # after retraction would overwrite the generated-so-far span with
-            # prefill-phase routing.
+            # prefill-phase routing. The credit router also saves the request's
+            # credit balance here, for the re-prefill to restore.
             from sglang.srt.state_capturer.base import (
                 snapshot_decode_records_on_retract,
             )
