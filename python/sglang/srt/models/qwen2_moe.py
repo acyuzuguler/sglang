@@ -339,6 +339,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
             self.top_k = config.num_experts_per_tok
         self.is_nextn = is_nextn
+        # Gate-score capture / credit-blaze-cai routing (router_hook) applies to target
+        # layers only: the nextn draft layer (Qwen3_5ForCausalLMMTP) runs in the same
+        # process and would otherwise reach the target's process-global router with its
+        # draft batches (deepseek_v2 precedent, router_hook.apply_moe_router_hook contract).
+        self._moe_router_hook_enabled = not is_nextn
 
     def get_moe_weights(self):
         return [
@@ -496,14 +501,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         router_logits, _ = self.gate(hidden_states)
 
         topk_output = self.topk(hidden_states, router_logits)
-        # Gate-score capture + credit/blaze/cai routing override (see router_hook).
-        topk_output = apply_moe_router_hook(
-            layer_id=self.layer_id,
-            router_logits=router_logits,
-            forward_batch=forward_batch,
-            topk_config=self.topk.topk_config,
-            topk_output=topk_output,
-        )
+        if self._moe_router_hook_enabled:
+            # Gate-score capture + credit/blaze/cai routing override (see router_hook).
+            topk_output = apply_moe_router_hook(
+                layer_id=self.layer_id,
+                router_logits=router_logits,
+                forward_batch=forward_batch,
+                topk_config=self.topk.topk_config,
+                topk_output=topk_output,
+            )
         if self.enable_shared_expert_fusion and TopKOutputChecker.format_is_standard(
             topk_output
         ):

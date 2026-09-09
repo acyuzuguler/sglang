@@ -201,6 +201,82 @@ def get_active_moe_router():
 
 
 # ---------------------------------------------------------------------------
+# Per-stage method switch (SGLANG_DECODE_METHOD / SGLANG_PREFILL_METHOD).
+# ---------------------------------------------------------------------------
+
+MOE_ROUTER_METHODS = ("credit", "blaze", "cai")
+VANILLA_METHOD = "vanilla"
+
+
+class StageMethods(msgspec.Struct, frozen=True, kw_only=True):
+    """Routing method of each forward stage: VANILLA_METHOD or the enabled router's name."""
+
+    decode: str
+    prefill: str
+
+
+def resolve_stage_methods(*, active: Optional[str]) -> StageMethods:
+    """Validate SGLANG_DECODE_METHOD / SGLANG_PREFILL_METHOD against the enabled
+    router (`active`: one of MOE_ROUTER_METHODS, or None when no router is on)
+    and return the method of each stage.
+
+    A stage's env var may be unset (= the enabled router, or "vanilla" without
+    one), "vanilla" (the stage keeps the model's stock top-k; the enabled router
+    still records the vanilla ids of those rows in its dump) or the enabled
+    router's name. Anything else raises: two different routing-modification
+    methods across the stages would need two routers at once (they are mutually
+    exclusive), a router name without that router enabled is a misconfigured
+    launch that would otherwise silently run vanilla, and both stages "vanilla"
+    with a router enabled means the router should not have been enabled at all.
+    """
+    assert active is None or active in MOE_ROUTER_METHODS, active
+    default = VANILLA_METHOD if active is None else active
+    resolved = {}
+    for stage, env in (
+        ("decode", envs.SGLANG_DECODE_METHOD),
+        ("prefill", envs.SGLANG_PREFILL_METHOD),
+    ):
+        value = env.get()
+        if value is None or value == "":
+            resolved[stage] = default
+            continue
+        if value not in (VANILLA_METHOD, *MOE_ROUTER_METHODS):
+            raise ValueError(
+                f"{env.name}={value!r}: unknown routing method (expected "
+                f"{VANILLA_METHOD!r} or one of {MOE_ROUTER_METHODS})."
+            )
+        if value == VANILLA_METHOD or value == active:
+            resolved[stage] = value
+            continue
+        if active is None:
+            raise ValueError(
+                f"{env.name}={value!r} but SGLANG_{value.upper()}_ROUTER is not enabled; "
+                f"enable it or use {VANILLA_METHOD!r}."
+            )
+        raise ValueError(
+            f"{env.name}={value!r} with SGLANG_{active.upper()}_ROUTER enabled: a stage can "
+            f"only be {VANILLA_METHOD!r} or {active!r} (one routing-modification method per "
+            "server; the routers are mutually exclusive)."
+        )
+    if active is not None and all(m == VANILLA_METHOD for m in resolved.values()):
+        raise ValueError(
+            "SGLANG_DECODE_METHOD and SGLANG_PREFILL_METHOD are both "
+            f"{VANILLA_METHOD!r} while SGLANG_{active.upper()}_ROUTER is enabled; "
+            "leave the router disabled instead."
+        )
+    return StageMethods(decode=resolved["decode"], prefill=resolved["prefill"])
+
+
+def assert_stage_methods_without_router() -> None:
+    """Startup check for a server with NO routing-modification router enabled:
+    SGLANG_DECODE_METHOD / SGLANG_PREFILL_METHOD may then only be unset or
+    "vanilla" (a stale router name would otherwise silently run vanilla). With a
+    router enabled its create() has already validated them."""
+    if get_active_moe_router() is None:
+        resolve_stage_methods(active=None)
+
+
+# ---------------------------------------------------------------------------
 # Prefill (EXTEND) support shared by the three routers.
 #
 # An EXTEND forward carries extend_num_tokens rows laid out request by request
@@ -247,6 +323,33 @@ def assert_prefill_routing_server_args(*, feature: str) -> None:
         f"{feature} cannot tell the decode rows of a MIXED chunk apart from the "
         "prefill rows; launch without --enable-mixed-chunk."
     )
+
+
+def resolve_num_draft_tokens(*, feature: str) -> Optional[int]:
+    """Rows per request of a TARGET_VERIFY batch (speculative_num_draft_tokens), or None
+    without speculative decoding. Startup guard for the assumptions of the verify routing
+    path: a linear draft chain (eagle topk 1: row 0 = the step's root token, rows 1.. =
+    the draft chain, the block layout the offline sim and the dumps use) and a constant
+    block length (no adaptive speculation; the routers hold it as an init-static value
+    that is read inside captured CUDA graphs)."""
+    from sglang.srt.runtime_context import get_server_args
+
+    server_args = get_server_args()
+    if server_args.speculative_algorithm is None:
+        return None
+    assert server_args.speculative_eagle_topk in (None, 1), (
+        f"{feature} routes speculative verify blocks as a linear draft chain; got "
+        f"--speculative-eagle-topk {server_args.speculative_eagle_topk}."
+    )
+    assert not server_args.speculative_adaptive, (
+        f"{feature} needs a constant --speculative-num-draft-tokens; adaptive speculation "
+        "changes the verify block length at runtime."
+    )
+    num_draft_tokens = server_args.speculative_num_draft_tokens
+    assert isinstance(num_draft_tokens, int) and num_draft_tokens >= 1, (
+        f"{feature}: speculative_num_draft_tokens={num_draft_tokens!r} must be a positive int."
+    )
+    return num_draft_tokens
 
 
 def check_extend_batch(*, forward_batch: "ForwardBatch", feature: str) -> None:

@@ -25,6 +25,11 @@
 #   requests, never at startup).
 # Gated to the models in router_hook.SUPPORTED_MOE_ROUTER_MODEL_TYPES and enabled
 # by SGLANG_BLAZE_ROUTER; a no-op for every other model / when off.
+# Per-stage switch (SGLANG_DECODE_METHOD / SGLANG_PREFILL_METHOD, resolved by
+# router_hook.resolve_stage_methods): a stage set to "vanilla" keeps the model's own
+# top-k and needs no sim population for that stage (its file family is never read),
+# but its rows are still written to the capturer so a dump always holds the
+# decisions the model actually used.
 #
 # Per token and layer: r = s - alpha * load picks the experts (Eq. 2), an affinity
 # guardrail pins the original top-1 where the top1-top2 gap exceeds tau (Eq. 7), and
@@ -68,6 +73,7 @@ from sglang.srt.layers.moe.router_hook import (
     build_prefill_ctx,
     check_prefill_ctx,
     resolve_moe_router_dims,
+    resolve_stage_methods,
     selection_scores,
     weights_from_template,
 )
@@ -197,8 +203,11 @@ class BlazeRouter:
                 "population that per-sample load profiles are computed from)."
             )
         assert_prefill_routing_server_args(feature="SGLANG_BLAZE_ROUTER")
+        stages = resolve_stage_methods(active="blaze")
         router = BlazeRouter(
             gate_scores_dir=gate_scores_dir,
+            decode_enabled=stages.decode == "blaze",
+            prefill_enabled=stages.prefill == "blaze",
             num_layers=dims.num_layers,
             num_experts=dims.num_experts,
             top_k=dims.top_k,
@@ -210,18 +219,24 @@ class BlazeRouter:
         )
         logger.info(
             "BlazeRouter enabled: layers=%d experts=%d k=%d alpha=%.4f tau=%.4f "
-            "decode: num_samples=%d sample_period=%d (inferred from the recorded "
-            "iteration ids) norm_load[max=%.2f]; prefill: num_samples=%d (lazy, "
-            "fixed per request) gate_scores_dir=%s",
+            "decode: %s; prefill: %s gate_scores_dir=%s",
             dims.num_layers,
             dims.num_experts,
             dims.top_k,
             router.alpha,
             router.tau,
-            router.num_samples,
-            router.sample_period,
-            router.load.max().item(),
-            router.prefill_table.num_samples,
+            (
+                f"num_samples={router.num_samples} sample_period={router.sample_period} "
+                "(inferred from the recorded iteration ids) "
+                f"norm_load[max={router.load.max().item():.2f}]"
+                if router.decode_enabled
+                else "vanilla (SGLANG_DECODE_METHOD)"
+            ),
+            (
+                f"num_samples={router.prefill_table.num_samples} (lazy, fixed per request)"
+                if router.prefill_enabled
+                else "vanilla (SGLANG_PREFILL_METHOD)"
+            ),
             gate_scores_dir,
         )
         return router
@@ -230,6 +245,8 @@ class BlazeRouter:
         self,
         *,
         gate_scores_dir: str,
+        decode_enabled: bool,
+        prefill_enabled: bool,
         num_layers: int,
         num_experts: int,
         top_k: int,
@@ -239,6 +256,13 @@ class BlazeRouter:
         max_running_requests: int,
         device: str,
     ):
+        assert isinstance(decode_enabled, bool) and isinstance(prefill_enabled, bool), \
+            (decode_enabled, prefill_enabled)
+        assert decode_enabled or prefill_enabled, "blaze router with both stages vanilla"
+        # Per-stage switch (header): a disabled stage routes vanilla but still records,
+        # and its sim population is never read.
+        self.decode_enabled = decode_enabled
+        self.prefill_enabled = prefill_enabled
         self.top_k = top_k
         self.tau = tau
         self.alpha = alpha  # fixed for the whole run
@@ -246,44 +270,53 @@ class BlazeRouter:
         if correction_bias is not None:
             correction_bias = correction_bias.to(device=device, dtype=torch.float32)
 
-        # [S, L, E] per-sample normalized loads from the sim DECODE population (see
-        # header); the sample period is inferred from the recorded iteration ids.
-        decode_entries, sample_period = scan_sim_gate_scores(
-            path=gate_scores_dir, label=DECODE_LABEL
-        )
-        self.load = _compute_sim_loads(
-            entries=decode_entries,
-            label=DECODE_LABEL,
-            num_layers=num_layers,
-            num_experts=num_experts,
-            top_k=top_k,
-            correction_bias=correction_bias,
-            device=device,
-        )
-        # Python ints so the modulo/div in the decode path are graph-safe
-        # constants.
-        self.num_samples = self.load.shape[0]
-        self.sample_period = sample_period
+        if decode_enabled:
+            # [S, L, E] per-sample normalized loads from the sim DECODE population (see
+            # header); the sample period is inferred from the recorded iteration ids.
+            decode_entries, sample_period = scan_sim_gate_scores(
+                path=gate_scores_dir, label=DECODE_LABEL
+            )
+            self.load = _compute_sim_loads(
+                entries=decode_entries,
+                label=DECODE_LABEL,
+                num_layers=num_layers,
+                num_experts=num_experts,
+                top_k=top_k,
+                correction_bias=correction_bias,
+                device=device,
+            )
+            # Python ints so the modulo/div in the decode path are graph-safe
+            # constants.
+            self.num_samples = self.load.shape[0]
+            self.sample_period = sample_period
+        else:
+            self.load = None
+            self.num_samples = self.sample_period = 0
 
         # Request-pool slots are 1..max_running_requests (slot 0 is the pool's own
         # padding row that padded graph rows read), so per-slot buffers hold
         # max_running_requests + 1 rows.
         num_slots = max_running_requests + 1
-        # Prefill sim population: per-request fixed sample, rows reduced lazily.
-        self.prefill_table = PrefillSampleTable(
-            path=gate_scores_dir,
-            num_layers=num_layers,
-            num_experts=num_experts,
-            num_slots=num_slots,
-            row_fn=lambda sample: _sim_load_row(
-                sample=sample,
-                top_k=top_k,
+        # Prefill sim population: per-request fixed sample, rows reduced lazily
+        # (None while prefill is vanilla: the prefill file family is never read).
+        self.prefill_table = (
+            PrefillSampleTable(
+                path=gate_scores_dir,
+                num_layers=num_layers,
                 num_experts=num_experts,
-                correction_bias=correction_bias,
+                num_slots=num_slots,
+                row_fn=lambda sample: _sim_load_row(
+                    sample=sample,
+                    top_k=top_k,
+                    num_experts=num_experts,
+                    correction_bias=correction_bias,
+                    device=device,
+                ),
                 device=device,
-            ),
-            device=device,
-            name="BlazeRouter",
+                name="BlazeRouter",
+            )
+            if prefill_enabled
+            else None
         )
         # Per-forward prefill context and the per-row sample index derived from it.
         self._prefill_ctx: Optional[PrefillCtx] = None
@@ -318,7 +351,7 @@ class BlazeRouter:
         request starting its prefill, and derive the per-row sample index."""
         self._prefill_ctx = None
         self._prefill_tok_sample = None
-        if not forward_batch.forward_mode.is_extend():
+        if not forward_batch.forward_mode.is_extend() or not self.prefill_enabled:
             return
         ctx = build_prefill_ctx(forward_batch=forward_batch, feature="SGLANG_BLAZE_ROUTER")
         self.prefill_table.assign_first_chunks(
@@ -348,6 +381,8 @@ class BlazeRouter:
             # Unexpected MoE backend (bypassed / triton-kernels); leave vanilla untouched.
             return topk_output
         if fm.is_extend():
+            if not self.prefill_enabled:
+                return self._route_vanilla(layer_id, topk_output)
             check_prefill_ctx(
                 ctx=self._prefill_ctx,
                 forward_batch=forward_batch,
@@ -370,6 +405,8 @@ class BlazeRouter:
                 f"got {router_logits.shape[0]} rows for "
                 f"{forward_batch.req_pool_indices.shape[0]} requests."
             )
+        if not self.decode_enabled:
+            return self._route_vanilla(layer_id, topk_output)
         # Each request is penalized with the sim sample matching its own decode
         # position (see header). Padded graph rows read pool slot 0's counter,
         # their outputs are discarded, and nothing is written.
@@ -378,6 +415,15 @@ class BlazeRouter:
         return self._route_rows(
             layer_id, router_logits, self.load[smp, layer_id], topk_output, topk_config, self._stats
         )
+
+    def _route_vanilla(self, layer_id, template):
+        """A stage switched to vanilla (header): the model's own top-k is used untouched
+        but still recorded, so the dump rows of this stage hold the real decisions instead
+        of whatever the capturer's device buffer held before. CUDA-graph safe."""
+        cap = get_global_blaze_capturer()
+        if cap is not None:
+            cap.capture(layer_id, template.topk_ids.to(torch.int16))
+        return template
 
     def _route_rows(self, layer_id, router_logits, load_rows, template, topk_config, stats):
         """BLAZE selection for B rows given each row's [E] normalized load."""
@@ -453,9 +499,9 @@ class BlazeRouter:
 
         if self._stats is None:
             return
-        if fm.is_decode():
+        if fm.is_decode() and self.decode_enabled:
             self._flush_stats(self._stats, "decode")
-        elif fm.is_extend():
+        elif fm.is_extend() and self.prefill_enabled:
             self._flush_stats(self._stats_prefill, "prefill")
 
     def _flush_stats(self, stats, phase):

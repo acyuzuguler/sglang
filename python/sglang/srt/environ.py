@@ -664,6 +664,18 @@ class Envs:
     )
     SGLANG_LOG_GATE_SCORES_DIR = EnvStr(None)
 
+    # Per-stage switch shared by the routing-modification routers below (credit /
+    # blaze / cai; resolved by layers/moe/router_hook.resolve_stage_methods at the
+    # enabled router's startup). Each is "vanilla" (that stage keeps the model's
+    # stock top-k; the enabled router's dump still records the vanilla ids of
+    # those rows so the offline metrics stay valid), the enabled router's name,
+    # or unset (= the enabled router). With no router enabled only unset /
+    # "vanilla" are accepted. Two different routing-modification methods across
+    # the stages (the routers are mutually exclusive) or both stages "vanilla"
+    # with a router enabled raise at startup.
+    SGLANG_DECODE_METHOD = EnvStr(None)
+    SGLANG_PREFILL_METHOD = EnvStr(None)
+
     # Credit-based MoE routing (per-request load balancing; supported MoE models
     # only -- see layers/moe/router_hook.py)
     SGLANG_CREDIT_ROUTER = EnvBool(False)
@@ -702,7 +714,8 @@ class Envs:
     #    [T_req, L, E] tensors} of one sim prefill step (ids may have gaps). A
     #    request is assigned one prefill sample at its first chunk (round-robin
     #    in id order) for all its prompt tokens; samples are reduced lazily on
-    #    first assignment. Both families are mandatory.
+    #    first assignment. A family is mandatory iff the router acts on its stage
+    #    (SGLANG_DECODE_METHOD / SGLANG_PREFILL_METHOD not "vanilla").
     SGLANG_SIM_GATE_SCORES_DIR = EnvStr(None)
 
     # BLAZE MoE routing (sim-load-penalized top-k, MLSys'26; supported MoE

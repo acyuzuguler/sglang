@@ -5,6 +5,11 @@
 # official reference, github.com/CASE-Lab-UMD/Capacity-Aware-MoE). Gated to the
 # models in router_hook.SUPPORTED_MOE_ROUTER_MODEL_TYPES and enabled by
 # SGLANG_CAI_ROUTER; a no-op for every other model / when off.
+# Per-stage switch (SGLANG_DECODE_METHOD / SGLANG_PREFILL_METHOD, resolved by
+# router_hook.resolve_stage_methods): a stage set to "vanilla" keeps the model's
+# own top-k and needs no sim population for that stage (its file family is never
+# read), but its rows are still written to the capturer so a dump always holds
+# the decisions the model actually used.
 #
 # SIM-THRESHOLD mode (our serving adaptation of the paper's per-batch cap): the
 # competing population is an offline large-cluster simulation
@@ -83,6 +88,7 @@ from sglang.srt.layers.moe.router_hook import (
     build_prefill_ctx,
     check_prefill_ctx,
     resolve_moe_router_dims,
+    resolve_stage_methods,
     selection_scores,
     weights_from_template,
 )
@@ -239,7 +245,10 @@ class CaiRouter:
                 "population that survival thresholds are computed from)."
             )
         assert_prefill_routing_server_args(feature="SGLANG_CAI_ROUTER")
+        stages = resolve_stage_methods(active="cai")
         router = CaiRouter(
+            decode_enabled=stages.decode == "cai",
+            prefill_enabled=stages.prefill == "cai",
             num_layers=dims.num_layers,
             num_experts=dims.num_experts,
             top_k=dims.top_k,
@@ -252,19 +261,25 @@ class CaiRouter:
         )
         logger.info(
             "CaiRouter enabled: experts=%d k=%d gamma=%.4f rounds=%d "
-            "(candidates per token k_all=%d) mode=sim-threshold decode: "
-            "num_samples=%d sample_period=%d (inferred from the recorded iteration "
-            "ids) capped_expert_columns=%.1f%%; prefill: num_samples=%d (lazy, "
-            "fixed per request) gate_scores_dir=%s",
+            "(candidates per token k_all=%d) mode=sim-threshold decode: %s; "
+            "prefill: %s gate_scores_dir=%s",
             dims.num_experts,
             dims.top_k,
             router.gamma,
             router.rounds,
             router.k_all,
-            router.num_samples,
-            router.sample_period,
-            (100 * router.thresholds.isfinite().float().mean()).item(),
-            router.prefill_table.num_samples,
+            (
+                f"num_samples={router.num_samples} sample_period={router.sample_period} "
+                "(inferred from the recorded iteration ids) capped_expert_columns="
+                f"{(100 * router.thresholds.isfinite().float().mean()).item():.1f}%"
+                if router.decode_enabled
+                else "vanilla (SGLANG_DECODE_METHOD)"
+            ),
+            (
+                f"num_samples={router.prefill_table.num_samples} (lazy, fixed per request)"
+                if router.prefill_enabled
+                else "vanilla (SGLANG_PREFILL_METHOD)"
+            ),
             gate_scores_dir,
         )
         return router
@@ -272,6 +287,8 @@ class CaiRouter:
     def __init__(
         self,
         *,
+        decode_enabled: bool,
+        prefill_enabled: bool,
         num_layers: int,
         num_experts: int,
         top_k: int,
@@ -282,6 +299,13 @@ class CaiRouter:
         max_running_requests: int,
         device: str,
     ):
+        assert isinstance(decode_enabled, bool) and isinstance(prefill_enabled, bool), \
+            (decode_enabled, prefill_enabled)
+        assert decode_enabled or prefill_enabled, "cai router with both stages vanilla"
+        # Per-stage switch (header): a disabled stage routes vanilla but still records,
+        # and its sim population is never read.
+        self.decode_enabled = decode_enabled
+        self.prefill_enabled = prefill_enabled
         if gamma <= 0:
             raise ValueError(f"SGLANG_CAI_GAMMA must be > 0, got {gamma}")
         if rounds < 1:
@@ -298,48 +322,57 @@ class CaiRouter:
         if correction_bias is not None:
             correction_bias = correction_bias.to(device=device, dtype=torch.float32)
 
-        # [S, L, E] survival thresholds from the sim DECODE population (see
-        # header); the sample period is inferred from the recorded iteration ids.
-        decode_entries, sample_period = scan_sim_gate_scores(
-            path=gate_scores_dir, label=DECODE_LABEL
-        )
-        self.thresholds = _compute_sim_thresholds(
-            entries=decode_entries,
-            label=DECODE_LABEL,
-            num_layers=num_layers,
-            num_experts=num_experts,
-            top_k=top_k,
-            k_all=self.k_all,
-            gamma=gamma,
-            correction_bias=correction_bias,
-            device=device,
-        )
-        # Python ints so the modulo/div in the decode path are graph-safe
-        # constants.
-        self.num_samples = self.thresholds.shape[0]
-        self.sample_period = sample_period
+        if decode_enabled:
+            # [S, L, E] survival thresholds from the sim DECODE population (see
+            # header); the sample period is inferred from the recorded iteration ids.
+            decode_entries, sample_period = scan_sim_gate_scores(
+                path=gate_scores_dir, label=DECODE_LABEL
+            )
+            self.thresholds = _compute_sim_thresholds(
+                entries=decode_entries,
+                label=DECODE_LABEL,
+                num_layers=num_layers,
+                num_experts=num_experts,
+                top_k=top_k,
+                k_all=self.k_all,
+                gamma=gamma,
+                correction_bias=correction_bias,
+                device=device,
+            )
+            # Python ints so the modulo/div in the decode path are graph-safe
+            # constants.
+            self.num_samples = self.thresholds.shape[0]
+            self.sample_period = sample_period
+        else:
+            self.thresholds = None
+            self.num_samples = self.sample_period = 0
 
         # Request-pool slots are 1..max_running_requests (slot 0 is the pool's own
         # padding row that padded graph rows read), so per-slot buffers hold
         # max_running_requests + 1 rows.
         num_slots = max_running_requests + 1
-        # Prefill sim population: per-request fixed sample, rows reduced lazily.
-        self.prefill_table = PrefillSampleTable(
-            path=gate_scores_dir,
-            num_layers=num_layers,
-            num_experts=num_experts,
-            num_slots=num_slots,
-            row_fn=lambda sample: _sim_threshold_row(
-                sample=sample,
-                top_k=top_k,
-                k_all=self.k_all,
-                gamma=gamma,
+        # Prefill sim population: per-request fixed sample, rows reduced lazily
+        # (None while prefill is vanilla: the prefill file family is never read).
+        self.prefill_table = (
+            PrefillSampleTable(
+                path=gate_scores_dir,
+                num_layers=num_layers,
                 num_experts=num_experts,
-                correction_bias=correction_bias,
+                num_slots=num_slots,
+                row_fn=lambda sample: _sim_threshold_row(
+                    sample=sample,
+                    top_k=top_k,
+                    k_all=self.k_all,
+                    gamma=gamma,
+                    num_experts=num_experts,
+                    correction_bias=correction_bias,
+                    device=device,
+                )[0],
                 device=device,
-            )[0],
-            device=device,
-            name="CaiRouter",
+                name="CaiRouter",
+            )
+            if prefill_enabled
+            else None
         )
         # Per-forward prefill context and the per-row sample index derived from it.
         self._prefill_ctx: Optional[PrefillCtx] = None
@@ -369,7 +402,7 @@ class CaiRouter:
         request starting its prefill, and derive the per-row sample index."""
         self._prefill_ctx = None
         self._prefill_tok_sample = None
-        if not forward_batch.forward_mode.is_extend():
+        if not forward_batch.forward_mode.is_extend() or not self.prefill_enabled:
             return
         ctx = build_prefill_ctx(forward_batch=forward_batch, feature="SGLANG_CAI_ROUTER")
         self.prefill_table.assign_first_chunks(
@@ -401,6 +434,8 @@ class CaiRouter:
                 "unexpected MoE backend (bypassed / triton-kernels)."
             )
         if fm.is_extend():
+            if not self.prefill_enabled:
+                return self._route_vanilla(layer_id, topk_output)
             check_prefill_ctx(
                 ctx=self._prefill_ctx,
                 forward_batch=forward_batch,
@@ -428,6 +463,8 @@ class CaiRouter:
                 f"got {router_logits.shape[0]} rows for "
                 f"{forward_batch.req_pool_indices.shape[0]} requests."
             )
+        if not self.decode_enabled:
+            return self._route_vanilla(layer_id, topk_output)
         # Each request competes against the sim sample matching its own decode
         # position (see header). Per-token independent, so padded graph rows need
         # no masking: their ZERO-padded req_pool_indices read pool slot 0's
@@ -442,6 +479,23 @@ class CaiRouter:
             topk_config,
             self._stats,
         )
+
+    def _route_vanilla(self, layer_id, template):
+        """A stage switched to vanilla (header): the model's own top-k is used untouched
+        but still recorded (vanilla ids, no dropped slots, the vanilla weights) so the dump
+        rows of this stage hold the real decisions instead of whatever the capturer's
+        device buffer held before. CUDA-graph safe."""
+        cap = get_global_cai_capturer()
+        if cap is not None:
+            rec = torch.cat(
+                [
+                    template.topk_ids.to(torch.int16),
+                    template.topk_weights.to(torch.float16).view(torch.int16),
+                ],
+                dim=1,
+            )
+            cap.capture(layer_id, rec)  # [B, 2k]
+        return template
 
     def _route_rows(
         self, layer_id, router_logits, threshold_rows, template, topk_config, stats
@@ -536,9 +590,9 @@ class CaiRouter:
 
         if self._stats is None:
             return
-        if fm.is_decode():
+        if fm.is_decode() and self.decode_enabled:
             self._flush_stats(self._stats, "decode")
-        elif fm.is_extend():
+        elif fm.is_extend() and self.prefill_enabled:
             self._flush_stats(self._stats_prefill, "prefill")
 
     def _flush_stats(self, stats, phase):

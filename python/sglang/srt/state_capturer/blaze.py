@@ -22,7 +22,9 @@ class BlazeCapturer(BaseTopkCapturer):
     token (prefill and decode) it stores the k expert ids selected AFTER the
     blaze load penalty (what the model actually used), int16. Written by
     BlazeRouter._route_rows; rows [:input_len] are the prefill-phase decisions
-    (penalized with the request's fixed prefill sample), the rest decode.
+    (penalized with the request's fixed prefill sample), the rest decode. A
+    stage switched to vanilla (SGLANG_{DECODE,PREFILL}_METHOD) records its
+    vanilla ids via BlazeRouter._route_vanilla.
 
     Unlike the credit capturer there is no extra state channel: the guardrail /
     violation flags depend only on the gate scores and tau (not on alpha), so

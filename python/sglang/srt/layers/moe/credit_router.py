@@ -29,6 +29,16 @@
 #   the pinned expert is lifted above every other in the ranking, the remaining k - 1 slots
 #   follow the credit bias. p = 1 pins every top-1 (w1 > 0 always), 0 = off (w1 <= 1 never
 #   exceeds the cutoff, strict comparison). Pinned picks still pay.
+#   Speculative decoding (MTP / NEXTN, TARGET_VERIFY batches; mirrors the sim's 4-D verify
+#   blocks): the target verifies num_draft_tokens rows per request (row 0 = the step's root
+#   token, rows 1.. = the linear draft chain), laid out request-major. Every row of a
+#   request's block is ranked with the request's ONE credit state (broadcast over the block,
+#   sim select_expert_credit), the request regenerates +1 once per verify step, and every
+#   selected expert pays decode_cost * (fraction of the block's rows that picked it), so a
+#   verify step spends the same budget as one non-speculative token (sim CreditManager.spend);
+#   credits are then multiples of 1/num_draft_tokens (the capturer records them rounded).
+#   Protection pins per row. The draft model never reaches the router (qwen2_moe nextn gate)
+#   and a verify step touches no prefill state (no credit reset, no retraction restore).
 #
 # - PREFILL (EXTEND batches, eager; mirrors the sim's select_experts_credit_prefill):
 #   a hard, request-local token budget. Per chunk, request (T = its rows in this chunk)
@@ -53,6 +63,14 @@
 #
 # Routing weights in both phases are renormalized from the ORIGINAL (unbiased) scores of
 # the selected experts, so a flip never imports the biased score.
+#
+# Per-stage switch (SGLANG_DECODE_METHOD / SGLANG_PREFILL_METHOD, resolved by
+# router_hook.resolve_stage_methods): a stage set to "vanilla" keeps the model's own top-k
+# and touches no credit state (the decode credit reset on extend and the retraction
+# save/restore exist only while decode is credit-routed; the prefill context/budget only
+# while prefill is), but its rows are still written to the capturer, with
+# VANILLA_STAGE_CREDIT in the credit columns, so a dump always holds the decisions the
+# model actually used.
 
 import logging
 import math
@@ -68,6 +86,8 @@ from sglang.srt.layers.moe.router_hook import (
     build_prefill_ctx,
     check_prefill_ctx,
     resolve_moe_router_dims,
+    resolve_num_draft_tokens,
+    resolve_stage_methods,
     selection_scores,
     weights_from_template,
 )
@@ -81,6 +101,11 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
+
+# Capturer credit column of the rows of a stage switched to vanilla (header): int16 min. A
+# real decode balance would need 4096+ unregenerated picks to reach it and prefill budgets
+# are >= 1, so it cannot be mistaken for a recorded credit.
+VANILLA_STAGE_CREDIT = -32768
 
 
 class PrefillBudget(msgspec.Struct, frozen=True, kw_only=True):
@@ -189,11 +214,16 @@ class CreditRouter:
             model_config=model_config, feature="SGLANG_CREDIT_ROUTER"
         )
         assert_prefill_routing_server_args(feature="SGLANG_CREDIT_ROUTER")
+        stages = resolve_stage_methods(active="credit")
+        num_draft_tokens = resolve_num_draft_tokens(feature="SGLANG_CREDIT_ROUTER")
         router = CreditRouter(
             num_layers=dims.num_layers,
             num_experts=dims.num_experts,
             top_k=dims.top_k,
             max_running_requests=max_running_requests,
+            num_draft_tokens=num_draft_tokens,
+            decode_enabled=stages.decode == "credit",
+            prefill_enabled=stages.prefill == "credit",
             decode_max_cred=envs.SGLANG_CREDIT_DECODE_MAX_CRED.get(),
             prefill_max_cred=envs.SGLANG_CREDIT_PREFILL_MAX_CRED.get(),
             decode_cost=envs.SGLANG_CREDIT_DECODE_COST.get(),
@@ -204,12 +234,16 @@ class CreditRouter:
             device=device,
         )
         logger.info(
-            "CreditRouter enabled: layers=%d experts=%d k=%d "
+            "CreditRouter enabled: layers=%d experts=%d k=%d stages: decode=%s prefill=%s "
+            "num_draft_tokens=%s | "
             "decode: max_cred=%d cost=%d beta=%s protect=%s | prefill: max_cred=%d cost=%d protect=%s "
             "(per-request token budget, sim semantics)",
             dims.num_layers,
             dims.num_experts,
             dims.top_k,
+            stages.decode,
+            stages.prefill,
+            num_draft_tokens,
             router.decode_max_cred,
             router.decode_cost,
             router.decode_beta,
@@ -227,6 +261,9 @@ class CreditRouter:
         num_experts: int,
         top_k: int,
         max_running_requests: int,
+        num_draft_tokens: Optional[int],
+        decode_enabled: bool,
+        prefill_enabled: bool,
         decode_max_cred: int,
         prefill_max_cred: int,
         decode_cost: int,
@@ -236,6 +273,18 @@ class CreditRouter:
         prefill_protect: float,
         device: str,
     ):
+        assert isinstance(decode_enabled, bool) and isinstance(prefill_enabled, bool), \
+            (decode_enabled, prefill_enabled)
+        assert decode_enabled or prefill_enabled, "credit router with both stages vanilla"
+        # Rows per request of a TARGET_VERIFY batch (header: MTP), None without speculative
+        # decoding. Init-static (router_hook.resolve_num_draft_tokens asserts a constant
+        # block length), so route() can use it as a Python int inside captured CUDA graphs.
+        assert num_draft_tokens is None or (isinstance(num_draft_tokens, int) and num_draft_tokens >= 1), \
+            f"num_draft_tokens must be None or a positive int, got {num_draft_tokens!r}"
+        self.num_draft_tokens = num_draft_tokens
+        # Per-stage switch (header): a disabled stage routes vanilla but still records.
+        self.decode_enabled = decode_enabled
+        self.prefill_enabled = prefill_enabled
         for name, value in (("decode_cost", decode_cost), ("prefill_cost", prefill_cost)):
             assert isinstance(value, int) and value >= 0, f"{name} must be a non-negative int, got {value!r}"
         assert isinstance(decode_max_cred, int) and decode_max_cred > 0, \
@@ -287,7 +336,8 @@ class CreditRouter:
         # batches and None otherwise.
         self._prefill_ctx: Optional[PrefillCtx] = None
         self._prefill_budget: Optional[PrefillBudget] = None
-        # Live (un-padded) row count for the padding mask: written eagerly by
+        # Live (un-padded) REQUEST count for the padding mask (one row per request in
+        # DECODE, num_draft_tokens rows in TARGET_VERIFY): written eagerly by
         # on_forward_start before every forward, read inside the captured graph.
         # forward_batch.num_token_non_padded cannot serve this purpose on single GPU:
         # the decode graph runner attaches its static buffer to the captured batch
@@ -320,26 +370,45 @@ class CreditRouter:
         0, which masks every row: a replayed decode graph then touches no state,
         matching the eager IDLE no-op), and for EXTEND batches builds the prefill
         context (row -> slot map) and the per-request token budget of the chunk, and
-        restores the saved credit balance of re-prefilled (retracted) requests.
+        restores the saved credit balance of re-prefilled (retracted) requests. Each of
+        the two only while its stage is credit-routed (header: per-stage switch).
+        TARGET_VERIFY (MTP) batches only get the batch-size snapshot plus a check that
+        the live verify block has the init-static length route() uses in-graph.
         """
         self._num_valid.fill_(forward_batch.batch_size)
         self._prefill_ctx = None
         self._prefill_budget = None
-        if not forward_batch.forward_mode.is_extend():
+        fm = forward_batch.forward_mode
+        if fm.is_target_verify():
+            spec_info = forward_batch.spec_info
+            if self.num_draft_tokens is None or spec_info is None:
+                raise RuntimeError(
+                    "SGLANG_CREDIT_ROUTER: TARGET_VERIFY forward without speculative decoding "
+                    f"configured (num_draft_tokens={self.num_draft_tokens}, spec_info={spec_info})."
+                )
+            if spec_info.draft_token_num != self.num_draft_tokens:
+                raise RuntimeError(
+                    f"SGLANG_CREDIT_ROUTER: verify block of {spec_info.draft_token_num} rows per "
+                    f"request, expected {self.num_draft_tokens} (--speculative-num-draft-tokens)."
+                )
             return
-        ctx = build_prefill_ctx(
-            forward_batch=forward_batch, feature="SGLANG_CREDIT_ROUTER"
-        )
-        self._prefill_ctx = ctx
-        self._prefill_budget = _build_prefill_budget(
-            extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-            num_tokens=ctx.num_tokens,
-            max_cred=self.prefill_max_cred,
-            cost=self.prefill_cost,
-            protect=self.prefill_protect,
-            device=ctx.tok_slot.device,
-        )
-        self._restore_retracted(forward_batch=forward_batch)
+        if not fm.is_extend_without_speculative():
+            return
+        if self.prefill_enabled:
+            ctx = build_prefill_ctx(
+                forward_batch=forward_batch, feature="SGLANG_CREDIT_ROUTER"
+            )
+            self._prefill_ctx = ctx
+            self._prefill_budget = _build_prefill_budget(
+                extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                num_tokens=ctx.num_tokens,
+                max_cred=self.prefill_max_cred,
+                cost=self.prefill_cost,
+                protect=self.prefill_protect,
+                device=ctx.tok_slot.device,
+            )
+        if self.decode_enabled:
+            self._restore_retracted(forward_batch=forward_batch)
 
     def route(
         self,
@@ -357,49 +426,80 @@ class CreditRouter:
         fm = forward_batch.forward_mode
         if fm.is_idle():
             return topk_output
-        idx = forward_batch.req_pool_indices.long()  # [B]; decode: row i == request i
+        idx = forward_batch.req_pool_indices.long()  # [B] one pool slot per request
 
-        if fm.is_extend():
-            # (Re)initialize this layer's DECODE credit rows to max_cred so decode starts
-            # fresh after prefill (idempotent across prefill chunks), except for the rows of
-            # retracted requests being re-prefilled, which keep the balance on_forward_start
-            # restored (header). Padded rows (only present under a padded extend CUDA graph
-            # or its capture) are redirected to the pad_slot sink so they can never reset a
-            # live request's credits.
-            valid = torch.arange(idx.shape[0], device=idx.device) < self._num_valid
-            safe_idx = torch.where(valid, idx, torch.full_like(idx, self.pad_slot))
-            keep = self._keep_slot[safe_idx].unsqueeze(1)  # [B, 1]
-            self.creds[safe_idx, layer_id, :] = torch.where(
-                keep, self.creds[safe_idx, layer_id, :], self.max_cred_row
-            )
-            if self.debug:
-                self._dbg[1] += 1
+        if fm.is_extend_without_speculative():
+            if self.decode_enabled:
+                # (Re)initialize this layer's DECODE credit rows to max_cred so decode starts
+                # fresh after prefill (idempotent across prefill chunks), except for the rows
+                # of retracted requests being re-prefilled, which keep the balance
+                # on_forward_start restored (header). Padded rows (only present under a padded
+                # extend CUDA graph or its capture) are redirected to the pad_slot sink so they
+                # can never reset a live request's credits.
+                valid = torch.arange(idx.shape[0], device=idx.device) < self._num_valid
+                safe_idx = torch.where(valid, idx, torch.full_like(idx, self.pad_slot))
+                keep = self._keep_slot[safe_idx].unsqueeze(1)  # [B, 1]
+                self.creds[safe_idx, layer_id, :] = torch.where(
+                    keep, self.creds[safe_idx, layer_id, :], self.max_cred_row
+                )
+                if self.debug:
+                    self._dbg[1] += 1
+            if not TopKOutputChecker.format_is_standard(topk_output):
+                # Unexpected MoE backend (bypassed / triton-kernels); leave vanilla untouched.
+                return topk_output
+            if not self.prefill_enabled:
+                return self._route_vanilla(layer_id, topk_output)
             check_prefill_ctx(
                 ctx=self._prefill_ctx,
                 forward_batch=forward_batch,
                 num_rows=router_logits.shape[0],
                 feature="SGLANG_CREDIT_ROUTER",
             )
-            if not TopKOutputChecker.format_is_standard(topk_output):
-                # Unexpected MoE backend (bypassed / triton-kernels); leave vanilla untouched.
-                return topk_output
             return self._route_prefill(layer_id, router_logits, topk_output, topk_config)
 
-        if not fm.is_decode():
+        # Decode-phase rows: DECODE has one row per request, TARGET_VERIFY (MTP, header) has
+        # num_draft_tokens rows per request, request-major (rows [i*nd, (i+1)*nd) = request i).
+        if fm.is_target_verify():
+            num_draft_tokens = self.num_draft_tokens
+            if num_draft_tokens is None:
+                raise RuntimeError(
+                    "SGLANG_CREDIT_ROUTER: TARGET_VERIFY batch without speculative decoding configured."
+                )
+        elif fm.is_decode():
+            num_draft_tokens = 1
+        else:
             raise RuntimeError(
-                f"SGLANG_CREDIT_ROUTER: unsupported forward mode {fm.name} "
-                "(speculative decoding is not supported)."
+                f"SGLANG_CREDIT_ROUTER: unsupported forward mode {fm.name} (MIXED chunks and "
+                "draft-model batches must not reach the router)."
             )
         if not TopKOutputChecker.format_is_standard(topk_output):
             # Unexpected MoE backend (bypassed / triton-kernels); leave vanilla untouched.
             return topk_output
-        if router_logits.shape[0] != idx.shape[0]:
-            # Not the plain one-token-per-request decode layout; stay safe.
-            return topk_output
+        if router_logits.shape[0] != idx.shape[0] * num_draft_tokens:
+            raise RuntimeError(
+                f"SGLANG_CREDIT_ROUTER: {router_logits.shape[0]} router rows for "
+                f"{idx.shape[0]} requests x {num_draft_tokens} rows each ({fm.name}); "
+                "DP/EP-gathered MoE layouts are unsupported."
+            )
+        if not self.decode_enabled:
+            return self._route_vanilla(layer_id, topk_output)
 
         return self._route_decode(
-            layer_id, router_logits, idx, forward_batch, topk_output, topk_config
+            layer_id, router_logits, idx, forward_batch, topk_output, topk_config,
+            num_draft_tokens=num_draft_tokens,
         )
+
+    def _route_vanilla(self, layer_id, template):
+        """A stage switched to vanilla (header): the model's own top-k is used untouched
+        but still recorded, so the dump rows of this stage hold the real decisions instead
+        of whatever the capturer's device buffer held before; the credit columns carry
+        VANILLA_STAGE_CREDIT. Static shapes, no host sync: CUDA-graph safe."""
+        cap = get_global_credit_capturer()
+        if cap is not None:
+            ids = template.topk_ids.to(torch.int16)
+            rec = torch.cat([ids, torch.full_like(ids, VANILLA_STAGE_CREDIT)], dim=1)
+            cap.capture(layer_id, rec)  # [B, 2k]
+        return template
 
     def _route_prefill(self, layer_id, router_logits, template, topk_config):
         """Per-request token-budget routing over an EXTEND batch (see header; mirrors
@@ -465,12 +565,14 @@ class CreditRouter:
         )
 
     def _route_decode(
-        self, layer_id, router_logits, idx, forward_batch, template, topk_config
+        self, layer_id, router_logits, idx, forward_batch, template, topk_config, *, num_draft_tokens
     ):
-        B = router_logits.shape[0]
+        nd = num_draft_tokens  # rows per request: 1 (DECODE) or the MTP verify block length
+        B_req = idx.shape[0]  # requests, one pool slot each
+        B_rows = router_logits.shape[0]  # routed rows == B_req * nd, request-major (route())
         device = router_logits.device
 
-        # Real vs padded rows. Only when moe_ep_size > 1 is num_token_non_padded a
+        # Real vs padded requests. Only when moe_ep_size > 1 is num_token_non_padded a
         # registry-refreshed graph slot that is safe to read in-graph. On single GPU
         # the captured batch still carries the buffer, but nothing refreshes it at
         # replay -- it permanently holds the LAST captured shape's size (1), which
@@ -478,40 +580,45 @@ class CreditRouter:
         # CUDA graphs (this, not stale positions/seq_lens, was the root cause; both
         # of those ARE refreshed per replay in this tree). Use the router-owned
         # _num_valid instead: written eagerly before every forward, so padded tail
-        # rows (req_pool_indices == 0) are diverted to the pad_slot sink and pool
+        # requests (req_pool_indices == 0) are diverted to the pad_slot sink and pool
         # slot 0's live credits are never touched.
         ntn = forward_batch.num_token_non_padded
         if self.use_ntn and ntn is not None:
-            valid = torch.arange(B, device=device) < ntn  # [B] bool
+            valid = torch.arange(B_req, device=device) * nd < ntn  # [B_req] bool; ntn counts rows
         else:
-            valid = torch.arange(B, device=device) < self._num_valid  # [B] bool
-        valid_f = valid.view(B, 1).to(torch.float32)
+            valid = torch.arange(B_req, device=device) < self._num_valid  # [B_req] bool
+        valid_f = valid.view(B_req, 1).to(torch.float32)
         safe_idx = torch.where(valid, idx, torch.full_like(idx, self.pad_slot))
+        # Every row of a request's block shares the request's validity and credit state
+        # (sim: creds.unsqueeze(1) broadcast over the specdec dim). Int repeats: no host sync.
+        valid_rows = valid.repeat_interleave(nd)  # [B_rows] bool
+        valid_rows_f = valid_rows.view(B_rows, 1).to(torch.float32)
 
         scores = apply_scoring_func(router_logits.float(), topk_config.scoring_func)
         # Selection scores: what the model's vanilla topk ranks on (adds the
         # noaux_tc correction bias when the model has one; identity otherwise).
-        sel = selection_scores(scores=scores, topk_config=topk_config)  # [B, E]
+        sel = selection_scores(scores=scores, topk_config=topk_config)  # [B_rows, E]
 
         # Sim: CreditManager + select_expert_credit. All ops elementwise / gather / scatter /
         # topk on preallocated buffers: CUDA-graph safe.
-        # Regenerate: +1 credit for real rows, capped at max_cred.
-        creds = torch.clamp(self.creds[safe_idx, layer_id, :] + valid_f, max=self.decode_max_cred)
+        # Regenerate: +1 credit per real request (once per step, also under MTP), capped.
+        creds = torch.clamp(self.creds[safe_idx, layer_id, :] + valid_f, max=self.decode_max_cred)  # [B_req, E]
+        creds_rows = creds.repeat_interleave(nd, dim=0)  # [B_rows, E]
 
         # Soft credit bias: rank by sel + beta * creds/creds_rowmax * sel_rowmax. The rowmax
         # denominator is clamped to 1 so the bias keeps its sign and a row in overall debt
         # (all credits <= 0) cannot divide by zero or flip the ranking.
-        cred_bias = creds / creds.max(dim=-1, keepdim=True)[0].clamp(min=1.0) * sel.max(dim=-1, keepdim=True)[0]
+        cred_bias = creds_rows / creds_rows.max(dim=-1, keepdim=True)[0].clamp(min=1.0) * sel.max(dim=-1, keepdim=True)[0]
         ranked = sel + self.decode_beta * cred_bias
         if self.decode_protect > 0:
             # Top-1 protection (header): the pinned expert is lifted above every other by `big`
             # (a 0-d device tensor exceeding the ranking range, no host sync), the remaining
             # k - 1 slots follow the credit bias. Sim: the pinned mask in
-            # GateRouterCredit.get_decode_exp_ids.
+            # GateRouterCredit.get_decode_exp_ids (per row, also under MTP).
             pinned = self._decode_pinned(scores=scores, vanilla_ids=template.topk_ids.long())
             big = 2.0 * (ranked.amax() - ranked.amin()) + 2.0
             ranked = ranked + big * pinned.float()
-        _, ids = torch.topk(ranked, self.top_k, dim=-1)  # [B, k]
+        _, ids = torch.topk(ranked, self.top_k, dim=-1)  # [B_rows, k]
 
         weights = weights_from_template(
             gathered_scores=torch.gather(scores, 1, ids),
@@ -519,27 +626,31 @@ class CreditRouter:
             topk_config=topk_config,
         )
 
-        # Spend: every selected expert pays cost (real rows only); no floor, debt allowed.
-        spend = torch.zeros_like(creds).scatter_(
-            1, ids, (self.decode_cost * valid_f).expand(-1, self.top_k)
+        # Spend: every selected expert pays cost per real row, summed over the request's block
+        # and divided by its row count (sim CreditManager.spend: a verify step spends one
+        # token's budget, split over the block's picks); no floor, debt allowed.
+        spend_rows = torch.zeros_like(creds_rows).scatter_(
+            1, ids, (self.decode_cost * valid_rows_f).expand(-1, self.top_k)
         )
+        spend = spend_rows.view(B_req, nd, self.num_experts).sum(dim=1) / nd  # [B_req, E]
         self.creds[safe_idx, layer_id, :] = creds - spend
 
         cap = get_global_credit_capturer()
         if cap is not None:
             # Post-credit ids + the credit each selected expert held at decision time
-            # (post-regen, pre-spend); integer-valued, fits int16 (negative = debt).
-            sel_creds = torch.gather(creds, 1, ids).round().clamp(-32768, 32767)  # [B, k]
+            # (post-regen, pre-spend); integer-valued without MTP, multiples of 1/nd with it,
+            # recorded rounded; fits int16 (negative = debt).
+            sel_creds = torch.gather(creds_rows, 1, ids).round().clamp(-32768, 32767)  # [B_rows, k]
             rec = torch.cat([ids.to(torch.int16), sel_creds.to(torch.int16)], dim=1)
-            cap.capture(layer_id, rec)  # [B, 2k]
+            cap.capture(layer_id, rec)  # [B_rows, 2k]
 
         if self.debug:
-            changed = (ids.long() != template.topk_ids.long()).any(dim=-1) & valid  # [B]
+            changed = (ids.long() != template.topk_ids.long()).any(dim=-1) & valid_rows  # [B_rows]
             self._dbg[0] += 1
             self._dbg[2] += spend.sum().round().to(torch.int64)
             self._dbg[3] += changed.sum()
-            self._dbg[4] += B
-            self._dbg[5] += valid.sum()
+            self._dbg[4] += B_rows
+            self._dbg[5] += valid_rows.sum()
 
         return template._replace(
             topk_weights=weights.to(template.topk_weights.dtype),
@@ -565,6 +676,8 @@ class CreditRouter:
         released: keep its decode credit balance so the re-prefill can restore it. A request
         retracted again later overwrites its earlier save with the newer balance."""
         assert 0 <= req_pool_idx < self.pad_slot, (req_pool_idx, self.pad_slot)
+        if not self.decode_enabled:
+            return  # vanilla decode (header) keeps no per-request credit state
         self._saved_creds[rid] = self.creds[req_pool_idx].clone()  # [L, E]
         if self.debug:
             logger.info(

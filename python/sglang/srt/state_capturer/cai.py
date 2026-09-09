@@ -28,7 +28,9 @@ class CaiCapturer(BaseTopkCapturer):
                  int16 (dump() views them back)
 
     Written by CaiRouter._route_rows; rows [:input_len] are the prefill-phase
-    decisions (against the request's fixed prefill sample), the rest decode.
+    decisions (against the request's fixed prefill sample), the rest decode. A
+    stage switched to vanilla (SGLANG_{DECODE,PREFILL}_METHOD) records its
+    vanilla ids and weights (no dropped slots) via CaiRouter._route_vanilla.
     The weights are recorded because the
     drop changes them structurally (zeros + renormalization over survivors);
     offline, gate_scores (input) + these ids/weights (output) reproduce and

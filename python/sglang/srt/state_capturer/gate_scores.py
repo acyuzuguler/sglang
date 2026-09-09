@@ -122,12 +122,9 @@ class GateScoresCapturer(BaseTopkCapturer):
             name="gate_scores",
             dtype=torch.float16,
         )
-        # Spec verify capture (see class docstring). _pending_verify_blocks
-        # holds exactly one in-flight TARGET_VERIFY step (req_pool_idx ->
-        # [num_draft_tokens, L, E] cpu view); the per-rid dicts accumulate
-        # committed steps until the request finishes and dumps.
-        self._pending_verify_blocks: Optional[Dict[int, torch.Tensor]] = None
-        self._verify_scores: Dict[str, List[torch.Tensor]] = {}
+        # Spec verify capture (see class docstring): the score blocks are stashed /
+        # committed by the BaseTopkCapturer verify-block machinery; the accept run of
+        # every committed step is kept here per rid until the request finishes and dumps.
         self._verify_accept_tokens: Dict[str, List[List[int]]] = {}
 
     def on_forward_end(
@@ -147,48 +144,13 @@ class GateScoresCapturer(BaseTopkCapturer):
             self._stash_verify_blocks(forward_batch=forward_batch, rows=rows)
         return None
 
-    def _stash_verify_blocks(self, *, forward_batch: ForwardBatch, rows: torch.Tensor):
-        assert self._pending_verify_blocks is None, (
-            "previous verify step was never committed: a TARGET_VERIFY result "
-            "was dropped before process_batch_result_decode consumed it"
-        )
-        spec_info = forward_batch.spec_info
-        assert spec_info is not None, "TARGET_VERIFY forward without spec_info"
-        num_draft_tokens = spec_info.draft_token_num
-        assert spec_info.topk == 1, (
-            f"verify-score capture assumes a linear draft chain, got "
-            f"topk={spec_info.topk}"
-        )
-        req_pool_indices = forward_batch.req_pool_indices.cpu().tolist()
-        bs = len(req_pool_indices)
-        assert rows.shape == (bs * num_draft_tokens, self.num_layers, self.topk_size), (
-            f"verify rows shape {tuple(rows.shape)} != "
-            f"({bs} * {num_draft_tokens}, {self.num_layers}, {self.topk_size})"
-        )
-        blocks = rows.view(bs, num_draft_tokens, self.num_layers, self.topk_size)
-        self._pending_verify_blocks = {
-            pool_idx: blocks[i] for i, pool_idx in enumerate(req_pool_indices)
-        }
-        assert len(self._pending_verify_blocks) == bs, (
-            f"duplicate req_pool_idx in verify batch: {req_pool_indices}"
-        )
-
     def commit_verify_step(
         self, *, rid: str, req_pool_idx: int, accept_tokens: List[int]
     ):
         """Move the stashed verify block of one request into its per-rid
-        accumulator together with this step's accept run (bonus included)."""
-        assert self._pending_verify_blocks is not None, (
-            f"commit_verify_step for rid={rid} with no stashed verify step"
-        )
-        block = self._pending_verify_blocks.pop(req_pool_idx, None)
-        assert block is not None, (
-            f"no stashed verify block for req_pool_idx={req_pool_idx} "
-            f"(rid={rid}); pending: {sorted(self._pending_verify_blocks)}"
-        )
-        if not self._pending_verify_blocks:
-            self._pending_verify_blocks = None
-        self._verify_scores.setdefault(rid, []).append(block.clone())
+        accumulator (BaseTopkCapturer) together with this step's accept run
+        (bonus included)."""
+        super().commit_verify_step(rid=rid, req_pool_idx=req_pool_idx)
         self._verify_accept_tokens.setdefault(rid, []).append(
             [int(t) for t in accept_tokens]
         )
@@ -210,7 +172,7 @@ class GateScoresCapturer(BaseTopkCapturer):
             "input_len": input_len,
             "output_len": output_len,
         }
-        verify_scores = self._verify_scores.pop(rid, None)
+        verify_scores = self._pop_verify_blocks(rid=rid)
         verify_accept_tokens = self._verify_accept_tokens.pop(rid, None)
         assert (verify_scores is None) == (verify_accept_tokens is None), (
             f"verify bookkeeping out of sync for rid={rid}"

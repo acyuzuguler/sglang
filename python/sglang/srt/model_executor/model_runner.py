@@ -219,6 +219,7 @@ from sglang.srt.state_capturer.gate_scores import (
     set_global_gate_scores_capturer,
 )
 from sglang.srt.layers.moe.router_hook import (
+    assert_stage_methods_without_router,
     collect_gate_correction_bias_if_needed,
     get_active_moe_router,
 )
@@ -811,6 +812,7 @@ class ModelRunner:
         self.init_blaze_capturer()
         self.init_cai_router()
         self.init_cai_capturer()
+        self.check_moe_stage_methods()
         self.init_routed_experts_capturer()
 
         self.init_indexer_capturer()
@@ -1002,6 +1004,11 @@ class ModelRunner:
                 device=self.device,
             )
         )
+
+    def check_moe_stage_methods(self):
+        if self.is_draft_worker:
+            return
+        assert_stage_methods_without_router()
 
     def init_indexer_capturer(self):
         set_global_indexer_capturer(
@@ -1411,8 +1418,13 @@ class ModelRunner:
         # Pre-forward hook: the active MoE router (credit / blaze / cai) snapshots
         # its per-forward state (live batch size for the in-graph padding mask,
         # prefill row->request context, lazy prefill sim samples) before a
-        # potential CUDA-graph replay.
-        if (moe_router := get_active_moe_router()) is not None:
+        # potential CUDA-graph replay. Target only: the router is process-global and
+        # the draft worker's forwards (also inside draft CUDA-graph capture) must not
+        # overwrite the target's per-forward state.
+        if (
+            not self.is_draft_worker
+            and (moe_router := get_active_moe_router()) is not None
+        ):
             moe_router.on_forward_start(forward_batch=forward_batch)
 
         with (
@@ -1462,7 +1474,10 @@ class ModelRunner:
                 no_copy_to_cpu=False,  # factory asserts --disable-overlap-schedule
             )
 
-        if (credit_router := get_global_credit_router()) is not None:
+        if (
+            not self.is_draft_worker
+            and (credit_router := get_global_credit_router()) is not None
+        ):
             credit_router.debug_flush()
 
         if (

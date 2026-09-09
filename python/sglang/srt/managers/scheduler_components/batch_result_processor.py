@@ -163,6 +163,16 @@ class SchedulerBatchResultProcessor:
             accept_tokens=accept_tokens,
         )
 
+    def _maybe_commit_verify_credits(self, req: Req):
+        """Commit this decode step's stashed verify block of post-credit routing
+        decisions (ALL draft candidate rows, accepted and rejected) into the credit
+        capturer; dumped with the finished request as "decode_expert_ids" /
+        "decode_credits" (the accept runs live in the gate-scores dump)."""
+        capturer = get_global_credit_capturer()
+        if capturer is None:
+            return
+        capturer.commit_verify_step(rid=req.rid, req_pool_idx=req.req_pool_idx)
+
     def _maybe_dump_gate_scores(self, req: Req):
         capturer = get_global_gate_scores_capturer()
         if capturer is None:
@@ -200,7 +210,8 @@ class SchedulerBatchResultProcessor:
             req_pool_idx=req.req_pool_idx,
             seqlen=seqlen,
             req_to_token_pool=self.req_to_token_pool,
-        )  # [seqlen-1, num_layers, 2*k] int16; every row carries post-credit ids+creds
+        )  # [seqlen-1, num_layers, 2*k] int16 by kv position (prompt + accepted rows);
+        # under MTP the decode blocks come from the committed verify steps instead
         record = capturer.apply_retract_snapshot(rid=req.rid, record=record)
         capturer.dump(
             rid=req.rid,
@@ -815,6 +826,7 @@ class SchedulerBatchResultProcessor:
 
             if is_spec:
                 self._maybe_commit_verify_scores(req, next_token_id)
+                self._maybe_commit_verify_credits(req)
 
             self._maybe_update_reasoning_tokens(req, next_token_id)
             req.time_stats.set_last_decode_finish_time()

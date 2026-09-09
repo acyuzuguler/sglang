@@ -1,6 +1,6 @@
 import dataclasses
 import logging
-from typing import Optional
+from typing import Dict, List, Optional
 
 import torch
 
@@ -132,9 +132,66 @@ class BaseTopkCapturer:
         # that actually generated those tokens (original prefill + decode
         # records) in the dump instead of the re-prefill routing of that span.
         self._retract_snapshots = {}
+        # Speculative verify capture (TARGET_VERIFY batches): the kv-position gather
+        # (get_topk) only ever sees a request's ACCEPTED rows, so capturers that
+        # record per-token decisions keep every verify step's whole block (accepted
+        # and rejected draft rows). _pending_verify_blocks holds exactly one
+        # in-flight step (req_pool_idx -> [num_draft_tokens, num_layers, topk_size]
+        # cpu view), stashed by a subclass's on_forward_end via _stash_verify_blocks;
+        # the scheduler's decode-result loop moves each request's block into the
+        # rid-keyed accumulator (commit_verify_step), which the subclass's dump pops
+        # (_pop_verify_blocks). Non-overlap scheduling (asserted by those subclasses'
+        # factories) guarantees the strict stash/commit alternation.
+        self._pending_verify_blocks: Optional[Dict[int, torch.Tensor]] = None
+        self._verify_blocks: Dict[str, List[torch.Tensor]] = {}
 
     def capture(self, layer_id: int, topk_indices: torch.Tensor):
         self.device_cache.capture(layer_id, topk_indices)
+
+    def _stash_verify_blocks(self, *, forward_batch: ForwardBatch, rows: torch.Tensor):
+        assert self._pending_verify_blocks is None, (
+            "previous verify step was never committed: a TARGET_VERIFY result "
+            "was dropped before process_batch_result_decode consumed it"
+        )
+        spec_info = forward_batch.spec_info
+        assert spec_info is not None, "TARGET_VERIFY forward without spec_info"
+        num_draft_tokens = spec_info.draft_token_num
+        assert spec_info.topk == 1, (
+            f"verify-block capture assumes a linear draft chain, got "
+            f"topk={spec_info.topk}"
+        )
+        req_pool_indices = forward_batch.req_pool_indices.cpu().tolist()
+        bs = len(req_pool_indices)
+        assert rows.shape == (bs * num_draft_tokens, self.num_layers, self.topk_size), (
+            f"verify rows shape {tuple(rows.shape)} != "
+            f"({bs} * {num_draft_tokens}, {self.num_layers}, {self.topk_size})"
+        )
+        blocks = rows.view(bs, num_draft_tokens, self.num_layers, self.topk_size)
+        self._pending_verify_blocks = {
+            pool_idx: blocks[i] for i, pool_idx in enumerate(req_pool_indices)
+        }
+        assert len(self._pending_verify_blocks) == bs, (
+            f"duplicate req_pool_idx in verify batch: {req_pool_indices}"
+        )
+
+    def commit_verify_step(self, *, rid: str, req_pool_idx: int):
+        """Move the stashed verify block of one request into its per-rid accumulator."""
+        assert self._pending_verify_blocks is not None, (
+            f"commit_verify_step for rid={rid} with no stashed verify step"
+        )
+        block = self._pending_verify_blocks.pop(req_pool_idx, None)
+        assert block is not None, (
+            f"no stashed verify block for req_pool_idx={req_pool_idx} "
+            f"(rid={rid}); pending: {sorted(self._pending_verify_blocks)}"
+        )
+        if not self._pending_verify_blocks:
+            self._pending_verify_blocks = None
+        self._verify_blocks.setdefault(rid, []).append(block.clone())
+
+    def _pop_verify_blocks(self, *, rid: str) -> Optional[List[torch.Tensor]]:
+        """The committed verify blocks of a finishing request, in step order; None when
+        it never ran a verify step (non-speculative decode, or finished at prefill)."""
+        return self._verify_blocks.pop(rid, None)
 
     def _get_local_slice(
         self,
