@@ -28,28 +28,36 @@
 #   multiples of 1/num_draft_tokens (the capturer records them rounded). Pinned picks pay.
 #
 #   "hardcap" (mirrors the sim's select_expert_per_req_cap + DataManager): a hard,
-#   request-local cap on how often an expert may serve one request's recent tokens. Every
-#   request keeps, per layer, a ring of the expert ids it selected over its last
-#   decode_max_cred decode steps (`past_ids`, one ring slot per step, -1 = empty) and the
-#   running per-expert count of that window (`counts`, always the bincount of the ring). Per
-#   decoded token, layer and request, expert e is BLOCKED when
-#       counts[e] > decode_beta * decode_max_cred * k / E
-#   i.e. once it served more than decode_beta times its fair share of the request's window
-#   (decode_beta >= 1, 1 = the fair share). Blocked experts are sunk below every unblocked
-#   one in the ranking (sel minus a constant exceeding the score range) and the token takes
-#   its best unblocked experts; with fewer than k unblocked experts the best blocked ones
-#   fill the remaining slots (vanilla fallback, as in prefill). A new request can pick one
-#   expert decode_beta * decode_max_cred * k / E times before the cap bites (the "initial
-#   credits" of the sim). The ring pointer is shared by all requests and advances once per
-#   decode forward (on_forward_start, eagerly, before the graph replay reads it), exactly
-#   like the sim's DataManager, so a request absent from decode steps (retraction re-prefill)
-#   keeps entries older than the window until the pointer comes round again. decode_cost is
-#   NOT used by this rule (kept as a knob the eval chain passes). Under MTP one ring slot
-#   holds the whole block's picks (num_draft_tokens * k ids per layer, rejected drafts
-#   included like the sim's decode metric) and the cap scales with the block,
-#       counts[e] > decode_beta * decode_max_cred * num_draft_tokens * k / E,
-#   so a verify step counts as one step of a num_draft_tokens-times denser window (the sim
-#   asserts specdec_len == 1; this is its block generalization). Pinned picks count.
+#   request-local cap on how often an expert may serve one request's recent tokens, with a
+#   threshold per top-k SLOT. Every request keeps, per layer, a ring of the expert ids it
+#   selected over its last decode_max_cred decode steps (`past_ids`, one ring slot per step,
+#   -1 = empty) and the running per-expert count of that window (`counts`, always the
+#   bincount of the ring). Slot i of a token (0 = its best expert) may only take an expert
+#   whose count is <= thresh[i], with
+#       thresh[i] = ((k-1-i)/(k-1))^6 * (high - low) + low,
+#       low  = min(decode_beta * decode_max_cred * k / E, W_max)  (decode_beta x the fair share),
+#       high = low + (W_max - low) * decode_protect,
+#       W_max = decode_max_cred (the largest possible count),
+#   so the later, weaker picks are constrained down to decode_beta x fair share (decode_beta
+#   >= 1) while slot 0 is protected up to decode_protect: at 1 the top-1 is never blocked, at 0
+#   every slot has the same threshold (the plain cap), in between the slots follow the fixed
+#   curve (no w1 pinning under this rule). Eligibility is nested
+#   (thresh non-increasing), so the selection is a greedy fill: slot i takes the
+#   highest-scoring expert not chosen yet that is eligible at i (blocked experts are sunk
+#   below every eligible one by a constant exceeding the score range, so a slot without an
+#   eligible expert left falls back to the best remaining blocked one, as in prefill); k
+#   masked argmax passes, fixed count, no host sync. A new request can pick one expert low
+#   times in every slot before the cap bites (the "initial credits" of the sim). The ring
+#   pointer is shared by all requests and advances once per decode forward
+#   (on_forward_start, eagerly, before the graph replay reads it), exactly like the sim's
+#   DataManager, so a request absent from decode steps (retraction re-prefill) keeps entries
+#   older than the window until the pointer comes round again. decode_cost is NOT used by
+#   this rule (kept as a knob the eval chain passes). Under MTP one ring slot holds the whole
+#   block's picks (num_draft_tokens * k ids per layer, rejected drafts included like the
+#   sim's decode metric), W_max = decode_max_cred * num_draft_tokens and
+#   low = decode_beta * decode_max_cred * num_draft_tokens * k / E, so a verify step counts
+#   as one step of a num_draft_tokens-times denser window (the sim asserts specdec_len == 1;
+#   this is its block generalization). Pinned picks count.
 #
 #   Shared by both rules: the per-request decode state is reset (softbias: creds =
 #   decode_max_cred; hardcap: ring -1, counts 0) by every extend chunk of a NEW request, so
@@ -59,12 +67,13 @@
 #   released) and written back into its new slot instead of the reset (on_forward_start).
 #   The re-prefilled rows themselves (prompt + tokens generated so far) are routed with the
 #   PREFILL rule below.
-#   Protection (decode_protect = p in [0, 1]): a token keeps its vanilla top-1 expert (slot 0
-#   of the model's own top-k) when its top-1 share w1 = s1 / sum(top-k unbiased scores)
-#   exceeds the absolute cutoff 1 - p. Stateless (a fixed cutoff, no per-request tracker);
-#   the pinned expert is lifted above every other in the ranking (and never blocked under
-#   hardcap), the remaining k - 1 slots follow the rule. p = 1 pins every top-1 (w1 > 0
-#   always), 0 = off (w1 <= 1 never exceeds the cutoff, strict comparison).
+#   Protection under softbias (decode_protect = p in [0, 1]): a token keeps its vanilla top-1
+#   expert (slot 0 of the model's own top-k) when its top-1 share w1 = s1 / sum(top-k unbiased
+#   scores) exceeds the absolute cutoff 1 - p. Stateless (a fixed cutoff, no per-request
+#   tracker); the pinned expert is lifted above every other in the ranking, the remaining
+#   k - 1 slots follow the credit bias. p = 1 pins every top-1 (w1 > 0 always), 0 = off (w1 <= 1
+#   never exceeds the cutoff, strict comparison). Under hardcap decode_protect is the slot-0
+#   protection level of the thresholds above instead; nothing is pinned.
 #   Speculative decoding (MTP / NEXTN, TARGET_VERIFY batches): the target verifies
 #   num_draft_tokens rows per request (row 0 = the step's root token, rows 1.. = the linear
 #   draft chain), laid out request-major. Every row of a block is ranked against the
@@ -290,10 +299,9 @@ class CreditRouter:
             )
         else:
             decode_desc = (
-                f"hardcap window={router.window_len} steps, blocked when count > beta "
-                f"{router.decode_beta} x fair share = {router.cap:.2f}, cost={router.decode_cost} "
-                f"unused, past_ids ring "
-                f"{router.past_ids.numel() * router.past_ids.element_size() / 2**20:.1f} MB"
+                f"hardcap window={router.window_len} steps, beta={router.decode_beta}, per-slot count "
+                f"thresholds {[round(t, 2) for t in router.thresh]}, cost={router.decode_cost} unused, "
+                f"past_ids ring {router.past_ids.numel() * router.past_ids.element_size() / 2**20:.1f} MB"
             )
         logger.info(
             "CreditRouter enabled: layers=%d experts=%d k=%d stages: decode=%s prefill=%s "
@@ -402,12 +410,23 @@ class CreditRouter:
             # Ring of the expert ids every request selected over its last window_len decode
             # steps (sim DataManager), one ring slot per step holding the step's routed
             # block (num_draft_tokens * k ids per layer, k without speculation), -1 = empty;
-            # `counts` is the ring's per-expert bincount, kept incrementally. An expert is
-            # blocked for a request's token once counts > cap.
+            # `counts` is the ring's per-expert bincount, kept incrementally. Slot i of a token
+            # may only take an expert with counts <= thresh[i] (header); init-static Python
+            # floats, read as scalars inside the captured graph.
             assert num_experts <= 32767, f"past_ids ring stores expert ids as int16, got {num_experts} experts"
             self.window_len = decode_max_cred
-            self.block_k = (1 if num_draft_tokens is None else num_draft_tokens) * top_k
-            self.cap = decode_beta * self.window_len * self.block_k / num_experts
+            nd = 1 if num_draft_tokens is None else num_draft_tokens
+            self.block_k = nd * top_k
+            w_max = float(self.window_len * nd)  # the largest count a ring can hold
+            low = min(decode_beta * self.window_len * self.block_k / num_experts, w_max)  # beta x fair share
+            high = low + (w_max - low) * decode_protect  # slot-0 threshold: w_max at protect 1, low at 0
+            assert top_k >= 2, top_k
+            self.thresh = tuple(
+                ((top_k - 1 - i) / (top_k - 1)) ** 6 * (high - low) + low for i in range(top_k)
+            )
+            assert all(a >= b for a, b in zip(self.thresh, self.thresh[1:])), \
+                f"slot thresholds must be non-increasing, got {self.thresh}"
+
             self.past_ids = torch.full(
                 (self.num_slots, self.window_len, num_layers, self.block_k),
                 -1,
@@ -456,7 +475,7 @@ class CreditRouter:
         # the captured graph (decode) / eagerly (prefill) and flushed per forward, so
         # they reflect what actually happens at replay. Layout:
         # [decode_layer_calls, reset_layer_calls, rule counter (softbias: credits spent;
-        #  hardcap: blocked (request, expert) pairs among valid requests), replaced,
+        #  hardcap: (request, expert) pairs over the last-slot threshold among valid requests), replaced,
         #  total_rows, valid_rows, prefill_layer_calls, prefill_credits_spent,
         #  prefill_replaced, prefill_rows]
         self.debug = envs.SGLANG_CREDIT_DEBUG.get()
@@ -710,10 +729,11 @@ class CreditRouter:
         # Selection scores: what the model's vanilla topk ranks on (adds the
         # noaux_tc correction bias when the model has one; identity otherwise).
         sel = selection_scores(scores=scores, topk_config=topk_config)  # [B_rows, E]
-        # Top-1 protection (header), per row also under MTP. Sim: the pinned mask in
+        # Top-1 pinning (header), softbias only, per row also under MTP; under hardcap
+        # decode_protect shapes the slot thresholds instead. Sim: the pinned mask in
         # GateRouterCredit.get_decode_exp_ids.
         pinned = None
-        if self.decode_protect > 0:
+        if self.decode_rule == "softbias" and self.decode_protect > 0:
             pinned = self._decode_pinned(scores=scores, vanilla_ids=template.topk_ids.long())
 
         # Rule-specific ranking + state update (header). Both return the routed ids
@@ -725,7 +745,7 @@ class CreditRouter:
                 layer_id, safe_idx, valid, valid_rows, sel, pinned, nd=nd
             )
         else:
-            ids, sel_state = self._decode_hardcap(layer_id, safe_idx, valid, sel, pinned, nd=nd)
+            ids, sel_state = self._decode_hardcap(layer_id, safe_idx, valid, sel, nd=nd)
 
         weights = weights_from_template(
             gathered_scores=torch.gather(scores, 1, ids),
@@ -784,25 +804,29 @@ class CreditRouter:
         sel_creds = torch.gather(creds_rows, 1, ids).round().clamp(-32768, 32767)  # [B_rows, k]
         return ids, sel_creds
 
-    def _decode_hardcap(self, layer_id, safe_idx, valid, sel, pinned, *, nd):
-        """Hard window cap (header; sim DataManager.get_exp_bincnts + select_expert_per_req_cap
-        + add_exp_ids): block the experts over the cap, rank, push the routed block into the
-        ring. Returns (ids [B_rows, k], window count of each selected expert before this
-        step's update [B_rows, k], <= window_len * block rows so it fits int16)."""
+    def _decode_hardcap(self, layer_id, safe_idx, valid, sel, *, nd):
+        """Hard window cap with per-slot thresholds (header; sim DataManager.get_exp_bincnts +
+        select_expert_per_req_cap + add_exp_ids): greedy fill of the k slots, then push the
+        routed block into the ring. Returns (ids [B_rows, k] in slot order, window count of
+        each selected expert before this step's update [B_rows, k], <= window_len * block rows
+        so it fits int16)."""
         B_req, device = safe_idx.shape[0], sel.device
         counts = self.counts[safe_idx, layer_id, :]  # [B_req, E] int32, the request's window
-        blocked = counts > self.cap  # [B_req, E]
-        blocked_rows = blocked.repeat_interleave(nd, dim=0)  # [B_rows, E]
+        counts_rows = counts.repeat_interleave(nd, dim=0)  # [B_rows, E]
         # `big` exceeds the selection-score range (0-d device tensor, no host sync): minus big
-        # sinks a blocked expert below every unblocked one, plus big lifts a pinned one above
-        # all; the relative order within each group stays the vanilla one.
+        # sinks a blocked expert below every eligible one (fallback order); eligible scores are
+        # never shifted, so no low-order bits are lost and the order within each group stays
+        # the vanilla one.
         big = sel.amax() - sel.amin() + 1.0
-        ranked = sel
-        if pinned is not None:
-            blocked_rows = blocked_rows & ~pinned  # a pinned expert is never blocked
-            ranked = ranked + big * pinned.float()
-        ranked = ranked - big * blocked_rows.float()
-        _, ids = torch.topk(ranked, self.top_k, dim=-1)  # [B_rows, k]
+        selected = torch.zeros_like(sel, dtype=torch.bool)
+        ids = []
+        for th in self.thresh:  # k passes, init-static scalars: capture-stable
+            eligible = counts_rows <= th
+            key = (sel - big * (~eligible).float()).masked_fill(selected, -torch.inf)
+            idx = key.argmax(dim=-1, keepdim=True)  # [B_rows, 1]
+            selected.scatter_(1, idx, True)
+            ids.append(idx)
+        ids = torch.cat(ids, dim=1)  # [B_rows, k], slot 0 = the token's top-1
         # Window update: this step's ring slot drops its previous entry (-1 = empty lands in
         # the dropped column 0 of `delta`) and takes the request's routed block; counts
         # follow. A padded request rewrites the sink's current content (new = old), so
@@ -815,9 +839,8 @@ class CreditRouter:
         delta.scatter_add_(1, old + 1, -torch.ones_like(old, dtype=torch.int32))
         self.counts[safe_idx, layer_id, :] = counts + delta[:, 1:]
         self.past_ids[safe_idx, ptr, layer_id, :] = new.to(torch.int16)
-        if self.debug:
-            self._dbg[2] += (blocked & valid.view(B_req, 1)).sum()
-        counts_rows = counts.repeat_interleave(nd, dim=0)  # [B_rows, E]
+        if self.debug:  # (request, expert) pairs over the strictest (last-slot) threshold
+            self._dbg[2] += ((counts > self.thresh[-1]) & valid.view(B_req, 1)).sum()
         sel_counts = torch.gather(counts_rows, 1, ids).clamp(max=32767)  # [B_rows, k]
         return ids, sel_counts
 

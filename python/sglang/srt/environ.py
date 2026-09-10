@@ -695,10 +695,13 @@ class Envs:
     # and prefill phase (per-chunk bulk rule). An expert keeps about 1/COST picks per token.
     SGLANG_CREDIT_DECODE_COST = EnvInt(8)
     SGLANG_CREDIT_PREFILL_COST = EnvInt(4)
-    # DECODE_BETA: bias weight under "softbias", cap multiplier (>= 1) under "hardcap" (the
-    # default 0.8 is a softbias value; a hardcap launch must override it or fails at startup).
-    # DECODE_PROTECT: pin the vanilla top-1 when its top-k share w1 exceeds 1 - p (0 = off,
-    # 1 = every token).
+    # DECODE_BETA: bias weight under "softbias"; under "hardcap" the multiplier of the fair share
+    # that the LAST top-k slot may not exceed (>= 1; slot 0 is never blocked, the slots in between
+    # follow a fixed curve, see credit_router.py header). The default 0.8 is a softbias value; a
+    # hardcap launch must override it or fails at startup.
+    # DECODE_PROTECT: under "softbias" pin the vanilla top-1 when its top-k share w1 exceeds 1 - p
+    # (0 = off, 1 = every token); under "hardcap" the slot-0 protection level of the per-slot
+    # thresholds (1 = the top-1 is never blocked, 0 = every slot capped alike, no pinning).
     SGLANG_CREDIT_DECODE_BETA = EnvFloat(0.8)
     SGLANG_CREDIT_DECODE_PROTECT = EnvFloat(0.0)
     # Prefill is a hard per-request token budget (an expert serves at most
