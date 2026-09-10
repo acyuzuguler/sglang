@@ -24,11 +24,12 @@ class CreditCapturer(BaseTopkCapturer):
     (int16):
 
       [0:k]      selected expert ids AFTER the credit logic (what the model used)
-      [k:2k]     decode rows: the credit balance of each selected expert at
-                 decision time (after regen, before spend) -- the values the
-                 selection saw; under MTP the balances are multiples of
-                 1/specdec_len (a verify step spends one token's budget over its
-                 block, see credit_router header) and are recorded rounded.
+      [k:2k]     decode rows, per SGLANG_CREDIT_DECODE_RULE (credit_router header):
+                 "softbias": the credit balance of each selected expert at decision
+                 time (after regen, before spend; under MTP multiples of
+                 1/specdec_len, recorded rounded); "hardcap": the window count of
+                 each selected expert (how many of the request's last window_len
+                 routed blocks picked it, before this step's update).
                  Prefill rows: the request's per-expert budget for
                  that chunk, T_req + prefill_max_cred (uniform over experts; an
                  expert serves at most budget // prefill_cost of the chunk's tokens).

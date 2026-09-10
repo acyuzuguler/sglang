@@ -679,18 +679,26 @@ class Envs:
     # Credit-based MoE routing (per-request load balancing; supported MoE models
     # only -- see layers/moe/router_hook.py)
     SGLANG_CREDIT_ROUTER = EnvBool(False)
-    # Initial / maximum credit balance per (layer, expert), separately per phase.
+    # Decode rule of the credit router (credit_router.py header), REQUIRED while decode is
+    # credit-routed, no default: "softbias" (rank on sel + BETA * cred/cred_max * sel_max with
+    # integer credits, +1 per step, -DECODE_COST per pick, no floor; BETA >= 0) or "hardcap"
+    # (block an expert for a request once its count over the request's last DECODE_MAX_CRED
+    # steps exceeds BETA * DECODE_MAX_CRED * k / E; BETA >= 1, 1 = the fair share, DECODE_COST
+    # unused). The two rules read DECODE_MAX_CRED / DECODE_BETA with different meanings.
+    SGLANG_CREDIT_DECODE_RULE = EnvStr(None)
+    # Decode: initial / maximum credits per (layer, expert) under "softbias", the window length
+    # in decode steps under "hardcap". Prefill: initial credits of the per-request token budget.
     SGLANG_CREDIT_DECODE_MAX_CRED = EnvInt(240)
     SGLANG_CREDIT_PREFILL_MAX_CRED = EnvInt(240)
-    # Credits spent per selected expert, separately for the decode phase (per-token
-    # rule inside the CUDA graph) and the prefill phase (per-chunk bulk rule). An expert
-    # keeps about 1/COST picks per token of a request.
+    # Credits spent per selected expert: decode phase under "softbias" (per-token rule inside
+    # the CUDA graph; unused under "hardcap" but still a knob because the eval chain passes it)
+    # and prefill phase (per-chunk bulk rule). An expert keeps about 1/COST picks per token.
     SGLANG_CREDIT_DECODE_COST = EnvInt(8)
     SGLANG_CREDIT_PREFILL_COST = EnvInt(4)
-    # Decode rule (credit_router.py header): rank on sel + BETA * cred/cred_max * sel_max with
-    # integer credits (+1 per token, -COST per pick, no floor). DECODE_PROTECT is the decode
-    # analogue of PREFILL_PROTECT: the fraction of tokens per request/layer whose top-1 expert
-    # is always kept (per-request running quantile of the top-1 share; 0 = off, 1 = every token).
+    # DECODE_BETA: bias weight under "softbias", cap multiplier (>= 1) under "hardcap" (the
+    # default 0.8 is a softbias value; a hardcap launch must override it or fails at startup).
+    # DECODE_PROTECT: pin the vanilla top-1 when its top-k share w1 exceeds 1 - p (0 = off,
+    # 1 = every token).
     SGLANG_CREDIT_DECODE_BETA = EnvFloat(0.8)
     SGLANG_CREDIT_DECODE_PROTECT = EnvFloat(0.0)
     # Prefill is a hard per-request token budget (an expert serves at most

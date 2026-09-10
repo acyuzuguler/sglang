@@ -321,9 +321,9 @@ def snapshot_decode_records_on_retract(
                 req_to_token_pool=req_to_token_pool,
             )
 
-    # The credit router keeps live per-request state (the decode credit balance) in
-    # the pool slot being released; save it so the re-prefill restores it instead of
-    # resetting to max_cred (credit_router.on_forward_start).
+    # The credit router keeps live per-request state (the decode window of past expert
+    # selections) in the pool slot being released; save it so the re-prefill restores it
+    # instead of resetting it (credit_router.on_forward_start).
     from sglang.srt.layers.moe.credit_router import get_global_credit_router
 
     credit_router = get_global_credit_router()

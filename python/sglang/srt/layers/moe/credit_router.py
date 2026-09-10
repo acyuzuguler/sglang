@@ -7,38 +7,70 @@
 # (SGLANG_CREDIT_{DECODE,PREFILL}_{MAX_CRED,COST}, SGLANG_CREDIT_DECODE_{BETA,PROTECT},
 # SGLANG_CREDIT_PREFILL_PROTECT):
 #
-# - DECODE (CUDA-graph safe; mirrors the sim's select_expert_credit + CreditManager): every
-#   request holds an integer-valued credit balance per (layer, expert) in `creds`, initialized to
-#   decode_max_cred and reset to it by every extend chunk of a NEW request, so decode starts
-#   fresh after prefill. A request the scheduler retracted (KV pool full) is re-prefilled later
-#   through the same extend path; its balance is saved at retraction (on_retract, called from
-#   the scheduler's retraction hook before the pool slot is released) and written back into
-#   its new slot instead of the reset (on_forward_start), so its decode continues with the
-#   credits it had. The re-prefilled rows themselves (prompt + tokens generated so far) are
-#   routed with the PREFILL rule below.
-#   Per decoded token: +1 credit (capped at decode_max_cred), then rank the experts on
+# - DECODE (CUDA-graph safe): one of two per-request rules, chosen at startup by
+#   SGLANG_CREDIT_DECODE_RULE (required while decode is credit-routed; an init-static Python
+#   constant, so every branch below is capture-stable and only the chosen rule's state is
+#   allocated). Both read decode_max_cred / decode_beta, with different meanings:
+#
+#   "softbias" (mirrors the sim's select_expert_credit + CreditManager): every request holds
+#   an integer-valued credit balance per (layer, expert) in `creds`, initialized to
+#   decode_max_cred. Per decoded token: +1 credit (capped at decode_max_cred), then rank the
+#   experts on
 #       sel + beta * cred_e / max_e(cred) * s_max(t)
-#   (sel = post-scoring-func gate score plus the noaux_tc correction bias when the model has one)
-#   and take the top-k, so a drained expert loses up to beta * s_max of ranking score and the
-#   token takes its next-best expert instead; then every selected expert pays decode_cost,
-#   with NO floor (real rows only): an over-demanded expert runs into debt (negative credit,
-#   negative bias) until it has regenerated. Knobs decode_max_cred / decode_cost / decode_beta.
+#   (sel = post-scoring-func gate score plus the noaux_tc correction bias when the model has
+#   one) and take the top-k, so a drained expert loses up to beta * s_max of ranking score
+#   and the token takes its next-best expert instead; then every selected expert pays
+#   decode_cost, with NO floor (real rows only): an over-demanded expert runs into debt
+#   (negative credit, negative bias) until it has regenerated. decode_beta >= 0. Under MTP
+#   (below) the request regenerates +1 once per verify step and every selected expert pays
+#   decode_cost * (fraction of the block's rows that picked it), so a verify step spends the
+#   same budget as one non-speculative token (sim CreditManager.spend); credits are then
+#   multiples of 1/num_draft_tokens (the capturer records them rounded). Pinned picks pay.
+#
+#   "hardcap" (mirrors the sim's select_expert_per_req_cap + DataManager): a hard,
+#   request-local cap on how often an expert may serve one request's recent tokens. Every
+#   request keeps, per layer, a ring of the expert ids it selected over its last
+#   decode_max_cred decode steps (`past_ids`, one ring slot per step, -1 = empty) and the
+#   running per-expert count of that window (`counts`, always the bincount of the ring). Per
+#   decoded token, layer and request, expert e is BLOCKED when
+#       counts[e] > decode_beta * decode_max_cred * k / E
+#   i.e. once it served more than decode_beta times its fair share of the request's window
+#   (decode_beta >= 1, 1 = the fair share). Blocked experts are sunk below every unblocked
+#   one in the ranking (sel minus a constant exceeding the score range) and the token takes
+#   its best unblocked experts; with fewer than k unblocked experts the best blocked ones
+#   fill the remaining slots (vanilla fallback, as in prefill). A new request can pick one
+#   expert decode_beta * decode_max_cred * k / E times before the cap bites (the "initial
+#   credits" of the sim). The ring pointer is shared by all requests and advances once per
+#   decode forward (on_forward_start, eagerly, before the graph replay reads it), exactly
+#   like the sim's DataManager, so a request absent from decode steps (retraction re-prefill)
+#   keeps entries older than the window until the pointer comes round again. decode_cost is
+#   NOT used by this rule (kept as a knob the eval chain passes). Under MTP one ring slot
+#   holds the whole block's picks (num_draft_tokens * k ids per layer, rejected drafts
+#   included like the sim's decode metric) and the cap scales with the block,
+#       counts[e] > decode_beta * decode_max_cred * num_draft_tokens * k / E,
+#   so a verify step counts as one step of a num_draft_tokens-times denser window (the sim
+#   asserts specdec_len == 1; this is its block generalization). Pinned picks count.
+#
+#   Shared by both rules: the per-request decode state is reset (softbias: creds =
+#   decode_max_cred; hardcap: ring -1, counts 0) by every extend chunk of a NEW request, so
+#   decode starts fresh after prefill. A request the scheduler retracted (KV pool full) is
+#   re-prefilled later through the same extend path; its decode state is saved at retraction
+#   (on_retract, called from the scheduler's retraction hook before the pool slot is
+#   released) and written back into its new slot instead of the reset (on_forward_start).
+#   The re-prefilled rows themselves (prompt + tokens generated so far) are routed with the
+#   PREFILL rule below.
 #   Protection (decode_protect = p in [0, 1]): a token keeps its vanilla top-1 expert (slot 0
 #   of the model's own top-k) when its top-1 share w1 = s1 / sum(top-k unbiased scores)
 #   exceeds the absolute cutoff 1 - p. Stateless (a fixed cutoff, no per-request tracker);
-#   the pinned expert is lifted above every other in the ranking, the remaining k - 1 slots
-#   follow the credit bias. p = 1 pins every top-1 (w1 > 0 always), 0 = off (w1 <= 1 never
-#   exceeds the cutoff, strict comparison). Pinned picks still pay.
-#   Speculative decoding (MTP / NEXTN, TARGET_VERIFY batches; mirrors the sim's 4-D verify
-#   blocks): the target verifies num_draft_tokens rows per request (row 0 = the step's root
-#   token, rows 1.. = the linear draft chain), laid out request-major. Every row of a
-#   request's block is ranked with the request's ONE credit state (broadcast over the block,
-#   sim select_expert_credit), the request regenerates +1 once per verify step, and every
-#   selected expert pays decode_cost * (fraction of the block's rows that picked it), so a
-#   verify step spends the same budget as one non-speculative token (sim CreditManager.spend);
-#   credits are then multiples of 1/num_draft_tokens (the capturer records them rounded).
-#   Protection pins per row. The draft model never reaches the router (qwen2_moe nextn gate)
-#   and a verify step touches no prefill state (no credit reset, no retraction restore).
+#   the pinned expert is lifted above every other in the ranking (and never blocked under
+#   hardcap), the remaining k - 1 slots follow the rule. p = 1 pins every top-1 (w1 > 0
+#   always), 0 = off (w1 <= 1 never exceeds the cutoff, strict comparison).
+#   Speculative decoding (MTP / NEXTN, TARGET_VERIFY batches): the target verifies
+#   num_draft_tokens rows per request (row 0 = the step's root token, rows 1.. = the linear
+#   draft chain), laid out request-major. Every row of a block is ranked against the
+#   request's ONE decode state (broadcast over the block, like the sim's specdec dim);
+#   protection pins per row. The draft model never reaches the router (qwen2_moe nextn gate)
+#   and a verify step touches no prefill state (no reset, no retraction restore).
 #
 # - PREFILL (EXTEND batches, eager; mirrors the sim's select_experts_credit_prefill):
 #   a hard, request-local token budget. Per chunk, request (T = its rows in this chunk)
@@ -74,7 +106,7 @@
 
 import logging
 import math
-from typing import TYPE_CHECKING, Dict, Optional
+from typing import TYPE_CHECKING, Dict, Optional, Tuple
 
 import msgspec
 import torch
@@ -106,6 +138,9 @@ logger = logging.getLogger(__name__)
 # real decode balance would need 4096+ unregenerated picks to reach it and prefill budgets
 # are >= 1, so it cannot be mistaken for a recorded credit.
 VANILLA_STAGE_CREDIT = -32768
+
+# SGLANG_CREDIT_DECODE_RULE values (header: DECODE).
+DECODE_RULES = ("softbias", "hardcap")
 
 
 class PrefillBudget(msgspec.Struct, frozen=True, kw_only=True):
@@ -216,6 +251,18 @@ class CreditRouter:
         assert_prefill_routing_server_args(feature="SGLANG_CREDIT_ROUTER")
         stages = resolve_stage_methods(active="credit")
         num_draft_tokens = resolve_num_draft_tokens(feature="SGLANG_CREDIT_ROUTER")
+        decode_rule = envs.SGLANG_CREDIT_DECODE_RULE.get()
+        if decode_rule is not None and decode_rule not in DECODE_RULES:
+            raise ValueError(
+                f"SGLANG_CREDIT_DECODE_RULE={decode_rule!r}: unknown decode rule (expected one of "
+                f"{DECODE_RULES})."
+            )
+        if stages.decode == "credit" and decode_rule is None:
+            raise ValueError(
+                "SGLANG_CREDIT_DECODE_RULE is unset but the decode stage is credit-routed; set one "
+                f"of {DECODE_RULES} (no default: the rules read DECODE_MAX_CRED / DECODE_BETA with "
+                "different meanings)."
+            )
         router = CreditRouter(
             num_layers=dims.num_layers,
             num_experts=dims.num_experts,
@@ -224,6 +271,7 @@ class CreditRouter:
             num_draft_tokens=num_draft_tokens,
             decode_enabled=stages.decode == "credit",
             prefill_enabled=stages.prefill == "credit",
+            decode_rule=decode_rule,
             decode_max_cred=envs.SGLANG_CREDIT_DECODE_MAX_CRED.get(),
             prefill_max_cred=envs.SGLANG_CREDIT_PREFILL_MAX_CRED.get(),
             decode_cost=envs.SGLANG_CREDIT_DECODE_COST.get(),
@@ -233,20 +281,31 @@ class CreditRouter:
             prefill_protect=envs.SGLANG_CREDIT_PREFILL_PROTECT.get(),
             device=device,
         )
+        if not router.decode_enabled:
+            decode_desc = "vanilla"
+        elif decode_rule == "softbias":
+            decode_desc = (
+                f"softbias max_cred={router.decode_max_cred} cost={router.decode_cost} "
+                f"beta={router.decode_beta}"
+            )
+        else:
+            decode_desc = (
+                f"hardcap window={router.window_len} steps, blocked when count > beta "
+                f"{router.decode_beta} x fair share = {router.cap:.2f}, cost={router.decode_cost} "
+                f"unused, past_ids ring "
+                f"{router.past_ids.numel() * router.past_ids.element_size() / 2**20:.1f} MB"
+            )
         logger.info(
             "CreditRouter enabled: layers=%d experts=%d k=%d stages: decode=%s prefill=%s "
-            "num_draft_tokens=%s | "
-            "decode: max_cred=%d cost=%d beta=%s protect=%s | prefill: max_cred=%d cost=%d protect=%s "
-            "(per-request token budget, sim semantics)",
+            "num_draft_tokens=%s | decode: %s protect=%s | "
+            "prefill: max_cred=%d cost=%d protect=%s (per-request token budget, sim semantics)",
             dims.num_layers,
             dims.num_experts,
             dims.top_k,
             stages.decode,
             stages.prefill,
             num_draft_tokens,
-            router.decode_max_cred,
-            router.decode_cost,
-            router.decode_beta,
+            decode_desc,
             router.decode_protect,
             router.prefill_max_cred,
             router.prefill_cost,
@@ -264,6 +323,7 @@ class CreditRouter:
         num_draft_tokens: Optional[int],
         decode_enabled: bool,
         prefill_enabled: bool,
+        decode_rule: Optional[str],
         decode_max_cred: int,
         prefill_max_cred: int,
         decode_cost: int,
@@ -276,6 +336,14 @@ class CreditRouter:
         assert isinstance(decode_enabled, bool) and isinstance(prefill_enabled, bool), \
             (decode_enabled, prefill_enabled)
         assert decode_enabled or prefill_enabled, "credit router with both stages vanilla"
+        # Decode rule (header): a Python constant, so the rule branches in route() /
+        # _route_decode / on_retract are capture-stable. None only for a vanilla decode stage.
+        if decode_enabled:
+            assert decode_rule in DECODE_RULES, \
+                f"decode_rule must be one of {DECODE_RULES} while decode is credit-routed, got {decode_rule!r}"
+        else:
+            assert decode_rule is None or decode_rule in DECODE_RULES, decode_rule
+        self.decode_rule = decode_rule
         # Rows per request of a TARGET_VERIFY batch (header: MTP), None without speculative
         # decoding. Init-static (router_hook.resolve_num_draft_tokens asserts a constant
         # block length), so route() can use it as a Python int inside captured CUDA graphs.
@@ -288,10 +356,14 @@ class CreditRouter:
         for name, value in (("decode_cost", decode_cost), ("prefill_cost", prefill_cost)):
             assert isinstance(value, int) and value >= 0, f"{name} must be a non-negative int, got {value!r}"
         assert isinstance(decode_max_cred, int) and decode_max_cred > 0, \
-            f"decode_max_cred must be a positive int, got {decode_max_cred!r}"
+            f"decode_max_cred (softbias: initial credits; hardcap: window length) must be a positive int, got {decode_max_cred!r}"
         assert isinstance(prefill_max_cred, int) and prefill_max_cred >= 0, \
             f"prefill_max_cred must be a non-negative int, got {prefill_max_cred!r}"
-        assert decode_beta >= 0, f"decode_beta must be >= 0, got {decode_beta!r}"
+        if decode_rule == "hardcap":
+            assert decode_beta >= 1.0, \
+                f"decode_beta is the cap multiplier of the decode window (>= 1, 1 = fair share), got {decode_beta!r}"
+        else:
+            assert decode_beta >= 0, f"decode_beta must be >= 0, got {decode_beta!r}"
         assert 0.0 <= decode_protect <= 1.0, \
             f"decode_protect must be in [0, 1], got {decode_protect!r}"
         assert 0.0 <= prefill_protect <= 1.0, \
@@ -306,30 +378,59 @@ class CreditRouter:
         self.prefill_cost = prefill_cost
         self.prefill_protect = prefill_protect
         # Request-pool slots are 1..max_running_requests (slot 0 is the pool's own
-        # padding row), so the buffer holds max_running_requests + 2 rows: one per
+        # padding row), so the buffers hold max_running_requests + 2 rows: one per
         # slot plus one reserved sink row (pad_slot) so padded (phantom) tokens under
-        # CUDA-graph replay can never touch a live request's credit state.
+        # CUDA-graph replay can never touch a live request's decode state.
         self.num_slots = max_running_requests + 2
         self.pad_slot = max_running_requests + 1
-        # Decode-phase credits (see header), integer-valued in a float32 buffer. Prefill keeps
-        # no cross-forward state.
-        self.creds = torch.full(
-            (self.num_slots, num_layers, num_experts),
-            float(decode_max_cred),
-            dtype=torch.float32,
-            device=device,
-        )
-        # Device-side row for the in-graph decode credit reset: assigning a Python scalar
-        # to a CUDA slice is an illegal CPU->CUDA copy during CUDA-graph capture, so we keep
-        # a preallocated on-device value to broadcast instead.
-        self.max_cred_row = torch.full(
-            (num_experts,), float(decode_max_cred), dtype=torch.float32, device=device
-        )
-        # Retraction support (header): the decode balance of every retracted request, saved
-        # per rid by on_retract until the request finishes (on_finish) or is retracted again
-        # (overwritten), and the per-forward slot mask that exempts the re-prefilled requests
-        # of the current EXTEND forward from the max-credit reset in route().
-        self._saved_creds: Dict[str, torch.Tensor] = {}
+        # Per-request decode state of the chosen rule (header). Prefill keeps no
+        # cross-forward state. Python scalars assigned to a CUDA slice are an illegal
+        # CPU->CUDA copy during CUDA-graph capture, so every in-graph reset broadcasts a
+        # preallocated on-device value instead.
+        if decode_rule == "softbias":
+            # Credits, integer-valued in a float32 buffer, plus the reset row.
+            self.creds = torch.full(
+                (self.num_slots, num_layers, num_experts),
+                float(decode_max_cred),
+                dtype=torch.float32,
+                device=device,
+            )
+            self.max_cred_row = torch.full(
+                (num_experts,), float(decode_max_cred), dtype=torch.float32, device=device
+            )
+        elif decode_rule == "hardcap":
+            # Ring of the expert ids every request selected over its last window_len decode
+            # steps (sim DataManager), one ring slot per step holding the step's routed
+            # block (num_draft_tokens * k ids per layer, k without speculation), -1 = empty;
+            # `counts` is the ring's per-expert bincount, kept incrementally. An expert is
+            # blocked for a request's token once counts > cap.
+            assert num_experts <= 32767, f"past_ids ring stores expert ids as int16, got {num_experts} experts"
+            self.window_len = decode_max_cred
+            self.block_k = (1 if num_draft_tokens is None else num_draft_tokens) * top_k
+            self.cap = decode_beta * self.window_len * self.block_k / num_experts
+            self.past_ids = torch.full(
+                (self.num_slots, self.window_len, num_layers, self.block_k),
+                -1,
+                dtype=torch.int16,
+                device=device,
+            )
+            self.counts = torch.zeros(
+                (self.num_slots, num_layers, num_experts), dtype=torch.int32, device=device
+            )
+            self._empty_ring = torch.full(
+                (self.window_len, self.block_k), -1, dtype=torch.int16, device=device
+            )
+            self._zero_counts = torch.zeros((num_experts,), dtype=torch.int32, device=device)
+            # Ring slot of the current decode step, shared by every request (sim
+            # DataManager.ptr): advanced eagerly once per DECODE / TARGET_VERIFY forward in
+            # on_forward_start, read inside the captured graph.
+            self._ptr = torch.zeros(1, dtype=torch.int64, device=device)
+        # Retraction support (header): the decode state of every retracted request (softbias:
+        # (creds row,); hardcap: (past_ids row, counts row)), saved per rid by on_retract
+        # until the request finishes (on_finish) or is retracted again (overwritten), and the
+        # per-forward slot mask that exempts the re-prefilled requests of the current EXTEND
+        # forward from the reset in route().
+        self._saved_state: Dict[str, Tuple[torch.Tensor, ...]] = {}
         self._keep_slot = torch.zeros(self.num_slots, dtype=torch.bool, device=device)
         # Per-forward prefill context (row -> slot map, validated per layer) and the
         # per-request budget of the chunk; both rebuilt by on_forward_start for EXTEND
@@ -345,7 +446,7 @@ class CreditRouter:
         # moe_ep_size > 1, so at replay it holds the LAST captured shape's size (= 1,
         # capture runs largest-to-smallest) and would mask out almost every real row.
         # Initialized to 0 so capture/warmup dummy forwards mask every row and leave
-        # the credit state untouched.
+        # the decode state untouched.
         self._num_valid = torch.zeros(1, dtype=torch.int32, device=device)
         # With moe_ep_size > 1 the num_token_non_padded slot IS registry-refreshed
         # (and counts the DP-gathered token layout, which _num_valid does not), so
@@ -354,9 +455,10 @@ class CreditRouter:
         # Optional debug counters (SGLANG_CREDIT_DEBUG): accumulated on-device INSIDE
         # the captured graph (decode) / eagerly (prefill) and flushed per forward, so
         # they reflect what actually happens at replay. Layout:
-        # [decode_layer_calls, reset_layer_calls, credits_spent, replaced, total_rows,
-        #  valid_rows, prefill_layer_calls, prefill_credits_spent, prefill_replaced,
-        #  prefill_rows]
+        # [decode_layer_calls, reset_layer_calls, rule counter (softbias: credits spent;
+        #  hardcap: blocked (request, expert) pairs among valid requests), replaced,
+        #  total_rows, valid_rows, prefill_layer_calls, prefill_credits_spent,
+        #  prefill_replaced, prefill_rows]
         self.debug = envs.SGLANG_CREDIT_DEBUG.get()
         self._dbg = torch.zeros(10, dtype=torch.int64, device=device) if self.debug else None
         self._dbg_totals = [0] * 10
@@ -368,17 +470,20 @@ class CreditRouter:
         Records the live (un-padded) batch size for the in-graph padding mask (so a
         graph replay reads this step's real row count; IDLE batches have batch_size
         0, which masks every row: a replayed decode graph then touches no state,
-        matching the eager IDLE no-op), and for EXTEND batches builds the prefill
-        context (row -> slot map) and the per-request token budget of the chunk, and
-        restores the saved credit balance of re-prefilled (retracted) requests. Each of
-        the two only while its stage is credit-routed (header: per-stage switch).
-        TARGET_VERIFY (MTP) batches only get the batch-size snapshot plus a check that
-        the live verify block has the init-static length route() uses in-graph.
+        matching the eager IDLE no-op), under the hardcap rule advances the decode ring
+        pointer once per DECODE / TARGET_VERIFY forward (one window step for every running
+        request, sim DataManager.ptr), and for EXTEND batches builds the prefill context
+        (row -> slot map) and the per-request token budget of the chunk, and restores the
+        saved decode state of re-prefilled (retracted) requests. Each only while its stage
+        is credit-routed (header: per-stage switch). TARGET_VERIFY (MTP) batches also get a
+        check that the live verify block has the init-static length route() uses in-graph.
         """
         self._num_valid.fill_(forward_batch.batch_size)
         self._prefill_ctx = None
         self._prefill_budget = None
         fm = forward_batch.forward_mode
+        if self.decode_rule == "hardcap" and (fm.is_decode() or fm.is_target_verify()):
+            self._ptr.add_(1).remainder_(self.window_len)
         if fm.is_target_verify():
             spec_info = forward_batch.spec_info
             if self.num_draft_tokens is None or spec_info is None:
@@ -430,18 +535,26 @@ class CreditRouter:
 
         if fm.is_extend_without_speculative():
             if self.decode_enabled:
-                # (Re)initialize this layer's DECODE credit rows to max_cred so decode starts
-                # fresh after prefill (idempotent across prefill chunks), except for the rows
-                # of retracted requests being re-prefilled, which keep the balance
-                # on_forward_start restored (header). Padded rows (only present under a padded
-                # extend CUDA graph or its capture) are redirected to the pad_slot sink so they
-                # can never reset a live request's credits.
+                # (Re)initialize this layer's DECODE state (softbias: creds = max_cred; hardcap:
+                # ring -1, counts 0) so decode starts fresh after prefill (idempotent across
+                # prefill chunks), except for the rows of retracted requests being re-prefilled,
+                # which keep the state on_forward_start restored (header). Padded rows (only
+                # present under a padded extend CUDA graph or its capture) are redirected to the
+                # pad_slot sink so they can never reset a live request's state.
                 valid = torch.arange(idx.shape[0], device=idx.device) < self._num_valid
                 safe_idx = torch.where(valid, idx, torch.full_like(idx, self.pad_slot))
-                keep = self._keep_slot[safe_idx].unsqueeze(1)  # [B, 1]
-                self.creds[safe_idx, layer_id, :] = torch.where(
-                    keep, self.creds[safe_idx, layer_id, :], self.max_cred_row
-                )
+                keep = self._keep_slot[safe_idx]  # [B]
+                if self.decode_rule == "softbias":
+                    self.creds[safe_idx, layer_id, :] = torch.where(
+                        keep.view(-1, 1), self.creds[safe_idx, layer_id, :], self.max_cred_row
+                    )
+                else:
+                    self.past_ids[safe_idx, :, layer_id, :] = torch.where(
+                        keep.view(-1, 1, 1), self.past_ids[safe_idx, :, layer_id, :], self._empty_ring
+                    )
+                    self.counts[safe_idx, layer_id, :] = torch.where(
+                        keep.view(-1, 1), self.counts[safe_idx, layer_id, :], self._zero_counts
+                    )
                 if self.debug:
                     self._dbg[1] += 1
             if not TopKOutputChecker.format_is_standard(topk_output):
@@ -587,38 +700,32 @@ class CreditRouter:
             valid = torch.arange(B_req, device=device) * nd < ntn  # [B_req] bool; ntn counts rows
         else:
             valid = torch.arange(B_req, device=device) < self._num_valid  # [B_req] bool
-        valid_f = valid.view(B_req, 1).to(torch.float32)
         safe_idx = torch.where(valid, idx, torch.full_like(idx, self.pad_slot))
-        # Every row of a request's block shares the request's validity and credit state
-        # (sim: creds.unsqueeze(1) broadcast over the specdec dim). Int repeats: no host sync.
+        # Every row of a request's block shares the request's validity and decode state
+        # (sim: one state row per request, broadcast over the specdec dim). Int repeats: no
+        # host sync.
         valid_rows = valid.repeat_interleave(nd)  # [B_rows] bool
-        valid_rows_f = valid_rows.view(B_rows, 1).to(torch.float32)
 
         scores = apply_scoring_func(router_logits.float(), topk_config.scoring_func)
         # Selection scores: what the model's vanilla topk ranks on (adds the
         # noaux_tc correction bias when the model has one; identity otherwise).
         sel = selection_scores(scores=scores, topk_config=topk_config)  # [B_rows, E]
-
-        # Sim: CreditManager + select_expert_credit. All ops elementwise / gather / scatter /
-        # topk on preallocated buffers: CUDA-graph safe.
-        # Regenerate: +1 credit per real request (once per step, also under MTP), capped.
-        creds = torch.clamp(self.creds[safe_idx, layer_id, :] + valid_f, max=self.decode_max_cred)  # [B_req, E]
-        creds_rows = creds.repeat_interleave(nd, dim=0)  # [B_rows, E]
-
-        # Soft credit bias: rank by sel + beta * creds/creds_rowmax * sel_rowmax. The rowmax
-        # denominator is clamped to 1 so the bias keeps its sign and a row in overall debt
-        # (all credits <= 0) cannot divide by zero or flip the ranking.
-        cred_bias = creds_rows / creds_rows.max(dim=-1, keepdim=True)[0].clamp(min=1.0) * sel.max(dim=-1, keepdim=True)[0]
-        ranked = sel + self.decode_beta * cred_bias
+        # Top-1 protection (header), per row also under MTP. Sim: the pinned mask in
+        # GateRouterCredit.get_decode_exp_ids.
+        pinned = None
         if self.decode_protect > 0:
-            # Top-1 protection (header): the pinned expert is lifted above every other by `big`
-            # (a 0-d device tensor exceeding the ranking range, no host sync), the remaining
-            # k - 1 slots follow the credit bias. Sim: the pinned mask in
-            # GateRouterCredit.get_decode_exp_ids (per row, also under MTP).
             pinned = self._decode_pinned(scores=scores, vanilla_ids=template.topk_ids.long())
-            big = 2.0 * (ranked.amax() - ranked.amin()) + 2.0
-            ranked = ranked + big * pinned.float()
-        _, ids = torch.topk(ranked, self.top_k, dim=-1)  # [B_rows, k]
+
+        # Rule-specific ranking + state update (header). Both return the routed ids
+        # [B_rows, k] and, for the capturer, the per-selected-expert state the selection saw
+        # [B_rows, k] (softbias: credit balance; hardcap: window count). All ops elementwise /
+        # gather / scatter / topk on preallocated buffers: CUDA-graph safe.
+        if self.decode_rule == "softbias":
+            ids, sel_state = self._decode_softbias(
+                layer_id, safe_idx, valid, valid_rows, sel, pinned, nd=nd
+            )
+        else:
+            ids, sel_state = self._decode_hardcap(layer_id, safe_idx, valid, sel, pinned, nd=nd)
 
         weights = weights_from_template(
             gathered_scores=torch.gather(scores, 1, ids),
@@ -626,28 +733,14 @@ class CreditRouter:
             topk_config=topk_config,
         )
 
-        # Spend: every selected expert pays cost per real row, summed over the request's block
-        # and divided by its row count (sim CreditManager.spend: a verify step spends one
-        # token's budget, split over the block's picks); no floor, debt allowed.
-        spend_rows = torch.zeros_like(creds_rows).scatter_(
-            1, ids, (self.decode_cost * valid_rows_f).expand(-1, self.top_k)
-        )
-        spend = spend_rows.view(B_req, nd, self.num_experts).sum(dim=1) / nd  # [B_req, E]
-        self.creds[safe_idx, layer_id, :] = creds - spend
-
         cap = get_global_credit_capturer()
         if cap is not None:
-            # Post-credit ids + the credit each selected expert held at decision time
-            # (post-regen, pre-spend); integer-valued without MTP, multiples of 1/nd with it,
-            # recorded rounded; fits int16 (negative = debt).
-            sel_creds = torch.gather(creds_rows, 1, ids).round().clamp(-32768, 32767)  # [B_rows, k]
-            rec = torch.cat([ids.to(torch.int16), sel_creds.to(torch.int16)], dim=1)
+            rec = torch.cat([ids.to(torch.int16), sel_state.to(torch.int16)], dim=1)
             cap.capture(layer_id, rec)  # [B_rows, 2k]
 
         if self.debug:
             changed = (ids.long() != template.topk_ids.long()).any(dim=-1) & valid_rows  # [B_rows]
             self._dbg[0] += 1
-            self._dbg[2] += spend.sum().round().to(torch.int64)
             self._dbg[3] += changed.sum()
             self._dbg[4] += B_rows
             self._dbg[5] += valid_rows.sum()
@@ -656,6 +749,77 @@ class CreditRouter:
             topk_weights=weights.to(template.topk_weights.dtype),
             topk_ids=ids.to(template.topk_ids.dtype),
         )
+
+    def _decode_softbias(self, layer_id, safe_idx, valid, valid_rows, sel, pinned, *, nd):
+        """Soft credit bias (header; sim CreditManager + select_expert_credit): regenerate,
+        rank on sel + beta * creds/creds_rowmax * sel_rowmax, spend. Returns (ids [B_rows, k],
+        credit of each selected expert post-regen pre-spend [B_rows, k], rounded to int16
+        range; negative = debt)."""
+        B_req, B_rows = safe_idx.shape[0], sel.shape[0]
+        valid_f = valid.view(B_req, 1).to(torch.float32)
+        valid_rows_f = valid_rows.view(B_rows, 1).to(torch.float32)
+        # Regenerate: +1 credit per real request (once per step, also under MTP), capped.
+        creds = torch.clamp(self.creds[safe_idx, layer_id, :] + valid_f, max=self.decode_max_cred)  # [B_req, E]
+        creds_rows = creds.repeat_interleave(nd, dim=0)  # [B_rows, E]
+        # The rowmax denominator is clamped to 1 so the bias keeps its sign and a row in
+        # overall debt (all credits <= 0) cannot divide by zero or flip the ranking.
+        cred_bias = creds_rows / creds_rows.max(dim=-1, keepdim=True)[0].clamp(min=1.0) * sel.max(dim=-1, keepdim=True)[0]
+        ranked = sel + self.decode_beta * cred_bias
+        if pinned is not None:
+            # The pinned expert is lifted above every other by `big` (a 0-d device tensor
+            # exceeding the ranking range, no host sync); the rest follow the credit bias.
+            big = 2.0 * (ranked.amax() - ranked.amin()) + 2.0
+            ranked = ranked + big * pinned.float()
+        _, ids = torch.topk(ranked, self.top_k, dim=-1)  # [B_rows, k]
+        # Spend: every selected expert pays cost per real row, summed over the request's block
+        # and divided by its row count (sim CreditManager.spend: a verify step spends one
+        # token's budget, split over the block's picks); no floor, debt allowed.
+        spend_rows = torch.zeros_like(creds_rows).scatter_(
+            1, ids, (self.decode_cost * valid_rows_f).expand(-1, self.top_k)
+        )
+        spend = spend_rows.view(B_req, nd, self.num_experts).sum(dim=1) / nd  # [B_req, E]
+        self.creds[safe_idx, layer_id, :] = creds - spend
+        if self.debug:
+            self._dbg[2] += spend.sum().round().to(torch.int64)
+        sel_creds = torch.gather(creds_rows, 1, ids).round().clamp(-32768, 32767)  # [B_rows, k]
+        return ids, sel_creds
+
+    def _decode_hardcap(self, layer_id, safe_idx, valid, sel, pinned, *, nd):
+        """Hard window cap (header; sim DataManager.get_exp_bincnts + select_expert_per_req_cap
+        + add_exp_ids): block the experts over the cap, rank, push the routed block into the
+        ring. Returns (ids [B_rows, k], window count of each selected expert before this
+        step's update [B_rows, k], <= window_len * block rows so it fits int16)."""
+        B_req, device = safe_idx.shape[0], sel.device
+        counts = self.counts[safe_idx, layer_id, :]  # [B_req, E] int32, the request's window
+        blocked = counts > self.cap  # [B_req, E]
+        blocked_rows = blocked.repeat_interleave(nd, dim=0)  # [B_rows, E]
+        # `big` exceeds the selection-score range (0-d device tensor, no host sync): minus big
+        # sinks a blocked expert below every unblocked one, plus big lifts a pinned one above
+        # all; the relative order within each group stays the vanilla one.
+        big = sel.amax() - sel.amin() + 1.0
+        ranked = sel
+        if pinned is not None:
+            blocked_rows = blocked_rows & ~pinned  # a pinned expert is never blocked
+            ranked = ranked + big * pinned.float()
+        ranked = ranked - big * blocked_rows.float()
+        _, ids = torch.topk(ranked, self.top_k, dim=-1)  # [B_rows, k]
+        # Window update: this step's ring slot drops its previous entry (-1 = empty lands in
+        # the dropped column 0 of `delta`) and takes the request's routed block; counts
+        # follow. A padded request rewrites the sink's current content (new = old), so
+        # nothing changes for it.
+        ptr = self._ptr.expand(B_req)
+        old = self.past_ids[safe_idx, ptr, layer_id, :].long()  # [B_req, block_k]
+        new = torch.where(valid.view(B_req, 1), ids.view(B_req, self.block_k), old)
+        delta = torch.zeros((B_req, self.num_experts + 1), dtype=torch.int32, device=device)
+        delta.scatter_add_(1, new + 1, torch.ones_like(new, dtype=torch.int32))
+        delta.scatter_add_(1, old + 1, -torch.ones_like(old, dtype=torch.int32))
+        self.counts[safe_idx, layer_id, :] = counts + delta[:, 1:]
+        self.past_ids[safe_idx, ptr, layer_id, :] = new.to(torch.int16)
+        if self.debug:
+            self._dbg[2] += (blocked & valid.view(B_req, 1)).sum()
+        counts_rows = counts.repeat_interleave(nd, dim=0)  # [B_rows, E]
+        sel_counts = torch.gather(counts_rows, 1, ids).clamp(max=32767)  # [B_rows, k]
+        return ids, sel_counts
 
     def _decode_pinned(self, *, scores: torch.Tensor, vanilla_ids: torch.Tensor) -> torch.Tensor:
         """[B, E] bool: the vanilla top-1 pick (slot 0 of the model's own top-k, exactly the
@@ -673,27 +837,34 @@ class CreditRouter:
 
     def on_retract(self, *, rid: str, req_pool_idx: int) -> None:
         """Scheduler hook for a request being retracted, called BEFORE its pool slot is
-        released: keep its decode credit balance so the re-prefill can restore it. A request
-        retracted again later overwrites its earlier save with the newer balance."""
+        released: keep its decode state (softbias: credits; hardcap: ring + counts) so the
+        re-prefill can restore it. A request retracted again later overwrites its earlier
+        save with the newer state."""
         assert 0 <= req_pool_idx < self.pad_slot, (req_pool_idx, self.pad_slot)
         if not self.decode_enabled:
-            return  # vanilla decode (header) keeps no per-request credit state
-        self._saved_creds[rid] = self.creds[req_pool_idx].clone()  # [L, E]
+            return  # vanilla decode (header) keeps no per-request decode state
+        if self.decode_rule == "softbias":
+            self._saved_state[rid] = (self.creds[req_pool_idx].clone(),)  # [L, E]
+        else:
+            self._saved_state[rid] = (
+                self.past_ids[req_pool_idx].clone(),  # [W, L, block_k]
+                self.counts[req_pool_idx].clone(),  # [L, E]
+            )
         if self.debug:
             logger.info(
-                "[credit-debug] retract: saved credits of rid=%s from slot %d (sum %.0f)",
-                rid, req_pool_idx, self._saved_creds[rid].sum().item(),
+                "[credit-debug] retract: saved decode state of rid=%s from slot %d (sum %.0f)",
+                rid, req_pool_idx, self._saved_state[rid][-1].sum().item(),
             )
 
     def on_finish(self, *, rid: str) -> None:
-        """Scheduler hook at request completion: drop the saved balance, if any."""
-        self._saved_creds.pop(rid, None)
+        """Scheduler hook at request completion: drop the saved state, if any."""
+        self._saved_state.pop(rid, None)
 
     def _restore_retracted(self, *, forward_batch: "ForwardBatch") -> None:
-        """EXTEND forwards only (eager). Write the saved balance of every retracted request
-        in the batch into its (new) pool slot and mark the slot so route() skips the
-        max-credit reset for it; idempotent across the chunks of one re-prefill. Fails
-        loudly on a retracted request without a save (the retraction hook was bypassed)."""
+        """EXTEND forwards only (eager). Write the saved decode state of every retracted
+        request in the batch into its (new) pool slot and mark the slot so route() skips the
+        reset for it; idempotent across the chunks of one re-prefill. Fails loudly on a
+        retracted request without a save (the retraction hook was bypassed)."""
         self._keep_slot.zero_()
         counts = forward_batch.moe_router_retraction_counts
         if counts is None:
@@ -710,18 +881,21 @@ class CreditRouter:
         for slot, rid, count in zip(slots, rids, counts):
             if count == 0:
                 continue
-            saved = self._saved_creds.get(rid)
+            saved = self._saved_state.get(rid)
             if saved is None:
                 raise RuntimeError(
                     f"SGLANG_CREDIT_ROUTER: rid={rid} (slot {slot}, retracted {count}x) is "
-                    "re-prefilled but has no saved credit balance."
+                    "re-prefilled but has no saved decode state."
                 )
-            self.creds[slot] = saved
+            if self.decode_rule == "softbias":
+                (self.creds[slot],) = saved
+            else:
+                self.past_ids[slot], self.counts[slot] = saved
             restored.append(slot)
             if self.debug:
                 logger.info(
-                    "[credit-debug] re-prefill: restored credits of rid=%s into slot %d (sum %.0f)",
-                    rid, slot, saved.sum().item(),
+                    "[credit-debug] re-prefill: restored decode state of rid=%s into slot %d (sum %.0f)",
+                    rid, slot, saved[-1].sum().item(),
                 )
         self._keep_slot[
             torch.tensor(restored, dtype=torch.long, device=self._keep_slot.device)
@@ -739,12 +913,13 @@ class CreditRouter:
             t = self._dbg_totals
             calls = max(t[0], 1)
             pcalls = max(t[6], 1)
+            rule_counter = "credits_spent" if self.decode_rule == "softbias" else "blocked_pairs"
             logger.info(
                 "[credit-debug] %d forwards: decode_layer_calls=%d reset_layer_calls=%d "
-                "credits_spent=%d replaced=%d | per_decode_call: rows=%.1f valid=%.1f "
+                "%s=%d replaced=%d | per_decode_call: rows=%.1f valid=%.1f "
                 "replaced=%.1f | prefill_layer_calls=%d prefill_credits_spent=%d "
                 "prefill_replaced_tokens=%.4f%% (of %d token-layers)",
-                self._dbg_steps, t[0], t[1], t[2], t[3],
+                self._dbg_steps, t[0], t[1], rule_counter, t[2], t[3],
                 t[4] / calls, t[5] / calls, t[3] / calls,
                 t[6], t[7], 100 * t[8] / max(t[9], 1), t[9],
             )
